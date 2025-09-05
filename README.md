@@ -337,8 +337,8 @@ oc patch ingresscontroller default -n openshift-ingress-operator \
 ### Development Setup
 ```bash
 # Clone repository
-git clone https://github.com/your-repo/openshift-health-report
-cd openshift-health-report
+git clone https://github.com/muneerkh/ocp-health-report.git
+cd ocp-health-report
 
 # Run tests
 ./openshift-health-report.sh --test

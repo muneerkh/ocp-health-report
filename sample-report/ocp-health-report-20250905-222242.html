@@ -1,0 +1,1690 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ocp - Health Report</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        html {
+            scroll-behavior: smooth;
+        }
+        
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', sans-serif;
+            line-height: 1.4;
+            color: #1e293b;
+            background: linear-gradient(135deg, #ffffff 0%, #f8fafc 50%, #f1f5f9 100%);
+            min-height: 100vh;
+            font-weight: 400;
+        }
+        
+        .container {
+            width: 90%;
+            max-width: none;
+            margin: 0 auto;
+            padding: 16px;
+            background: transparent;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 50%, #a855f7 100%);
+            color: white;
+            padding: 24px 32px;
+            border-radius: 16px;
+            margin-bottom: 20px;
+            box-shadow: 0 8px 24px rgba(79, 70, 229, 0.15), 0 4px 8px rgba(0, 0, 0, 0.1);
+            position: relative;
+            overflow: hidden;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .header::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: radial-gradient(circle at 20% 80%, rgba(255, 255, 255, 0.1) 0%, transparent 50%),
+                        radial-gradient(circle at 80% 20%, rgba(255, 255, 255, 0.1) 0%, transparent 50%);
+            pointer-events: none;
+        }
+        
+        .header h1 {
+            font-size: 2.4em;
+            margin-bottom: 20px;
+            font-weight: 700;
+            text-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+            letter-spacing: -1px;
+            position: relative;
+            z-index: 1;
+            background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .header-info {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 16px;
+            margin-top: 20px;
+            position: relative;
+            z-index: 1;
+        }
+        
+        .header-info-item {
+            background: rgba(255, 255, 255, 0.12);
+            backdrop-filter: blur(20px);
+            padding: 16px;
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .header-info-item::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: linear-gradient(90deg, rgba(255, 255, 255, 0.8) 0%, rgba(255, 255, 255, 0.2) 100%);
+        }
+        
+        .header-info-item:hover {
+            background: rgba(255, 255, 255, 0.2);
+            transform: translateY(-4px) scale(1.02);
+            box-shadow: 0 12px 24px rgba(0, 0, 0, 0.15);
+        }
+        
+        .header-info-item h3 {
+            font-size: 0.75em;
+            opacity: 0.85;
+            margin-bottom: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: rgba(255, 255, 255, 0.9);
+        }
+        
+        .header-info-item p {
+            font-size: 1.3em;
+            font-weight: 700;
+            line-height: 1.2;
+            word-break: break-all;
+            color: #ffffff;
+        }
+        
+        .summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        
+        .summary-card {
+            background: #ffffff;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.08);
+            border: 1px solid rgba(226, 232, 240, 0.8);
+            transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+            cursor: pointer;
+            text-decoration: none;
+            color: inherit;
+            display: block;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .summary-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: linear-gradient(90deg, #4f46e5 0%, #7c3aed 50%, #a855f7 100%);
+            transform: scaleX(0);
+            transition: transform 0.4s ease;
+        }
+        
+        .summary-card:hover {
+            transform: translateY(-8px);
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.12), 0 8px 16px rgba(0, 0, 0, 0.08);
+            border-color: rgba(79, 70, 229, 0.2);
+        }
+        
+        .summary-card:hover::before {
+            transform: scaleX(1);
+        }
+        
+        .summary-card:active {
+            transform: translateY(0px);
+        }
+        
+        .summary-card.healthy {
+            border-left-color: #28a745;
+        }
+        
+        .summary-card.warning {
+            border-left-color: #ffc107;
+        }
+        
+        .summary-card.critical {
+            border-left-color: #dc3545;
+        }
+        
+        .summary-card.unknown {
+            border-left-color: #6c757d;
+        }
+        
+        .summary-card h3 {
+            font-size: 1.1em;
+            margin-bottom: 10px;
+            color: #555;
+        }
+        
+        .status-indicator {
+            display: inline-flex;
+            align-items: center;
+            padding: 8px 20px;
+            border-radius: 24px;
+            font-size: 0.75em;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .status-indicator::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3), transparent);
+            transition: left 0.5s ease;
+        }
+        
+        .status-indicator:hover::before {
+            left: 100%;
+        }
+        
+        .status-healthy {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            color: white;
+            border: 1px solid rgba(16, 185, 129, 0.3);
+        }
+        
+        .status-warning {
+            background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+            color: white;
+            border: 1px solid rgba(245, 158, 11, 0.3);
+        }
+        
+        .status-critical {
+            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+            color: white;
+            border: 1px solid rgba(239, 68, 68, 0.3);
+        }
+        
+        .status-unknown {
+            background: linear-gradient(135deg, #6b7280 0%, #4b5563 100%);
+            color: white;
+            border: 1px solid rgba(107, 114, 128, 0.3);
+        }
+        
+        .section {
+            background: #ffffff;
+            margin-bottom: 24px;
+            border-radius: 12px;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04), 0 1px 4px rgba(0, 0, 0, 0.02);
+            border: 1px solid rgba(226, 232, 240, 0.6);
+            overflow: hidden;
+            transition: all 0.3s ease;
+        }
+        
+        .section:hover {
+            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.08), 0 4px 12px rgba(0, 0, 0, 0.06);
+        }
+        
+        .section-header {
+            background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+            padding: 16px 20px;
+            border-bottom: 1px solid rgba(226, 232, 240, 0.8);
+            position: relative;
+        }
+        
+        .section-header::before {
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: linear-gradient(90deg, #4f46e5 0%, #7c3aed 50%, #a855f7 100%);
+        }
+        
+        .section-header h2 {
+            font-size: 1.8em;
+            color: #0f172a;
+            margin-bottom: 8px;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+        }
+        
+        .section-header p {
+            color: #64748b;
+            margin: 0;
+            font-size: 1.05em;
+            font-weight: 500;
+        }
+        
+        .section-content {
+            padding: 20px;
+        }
+        
+        .detail-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+        }
+        
+        .detail-item {
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border-left: 4px solid #dee2e6;
+        }
+        
+        .detail-item.healthy {
+            border-left-color: #28a745;
+            background: #f8fff9;
+        }
+        
+        .detail-item.warning {
+            border-left-color: #ffc107;
+            background: #fffef8;
+        }
+        
+        .detail-item.critical {
+            border-left-color: #dc3545;
+            background: #fff8f8;
+        }
+        
+        .detail-item h4 {
+            margin-bottom: 8px;
+            color: #495057;
+        }
+        
+        .detail-item p {
+            margin-bottom: 5px;
+            font-size: 0.9em;
+        }
+        
+        .detail-item .status {
+            margin-top: 10px;
+        }
+        
+        .table-container {
+            overflow-x: auto;
+            border-radius: 16px;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04);
+            background: #ffffff;
+            border: 1px solid rgba(226, 232, 240, 0.6);
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+            margin-top: 0;
+        }
+        
+        th, td {
+            padding: 12px 16px;
+            text-align: left;
+            border-bottom: 1px solid rgba(226, 232, 240, 0.5);
+        }
+        
+        th {
+            background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+            font-weight: 700;
+            color: #0f172a;
+            text-transform: uppercase;
+            font-size: 0.75em;
+            letter-spacing: 1px;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+        
+        tbody tr {
+            transition: all 0.2s ease;
+        }
+        
+        tbody tr:hover {
+            background-color: rgba(248, 250, 252, 0.8);
+            transform: scale(1.001);
+        }
+        
+        tbody tr:last-child td {
+            border-bottom: none;
+        }
+        
+        th:first-child {
+            border-top-left-radius: 8px;
+        }
+        
+        th:last-child {
+            border-top-right-radius: 8px;
+        }
+        
+        tr:hover {
+            background-color: #f1f5f9;
+        }
+        
+        tr:last-child td:first-child {
+            border-bottom-left-radius: 8px;
+        }
+        
+        tr:last-child td:last-child {
+            border-bottom-right-radius: 8px;
+        }
+        
+        .footer {
+            text-align: center;
+            padding: 48px;
+            color: #64748b;
+            font-size: 0.95em;
+            border-top: 1px solid rgba(226, 232, 240, 0.8);
+            margin-top: 64px;
+            background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+            border-radius: 20px;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04);
+        }
+        
+        .footer p {
+            margin-bottom: 8px;
+            font-weight: 500;
+        }
+        
+        /* Responsive Design */
+        @media (max-width: 768px) {
+            .container {
+                padding: 16px;
+            }
+            
+            .header {
+                padding: 32px 24px;
+                border-radius: 16px;
+            }
+            
+            .header h1 {
+                font-size: 2.4em;
+                margin-bottom: 24px;
+            }
+            
+            .header-info {
+                grid-template-columns: 1fr;
+                gap: 16px;
+            }
+            
+            .header-info-item {
+                padding: 20px;
+            }
+            
+            .summary {
+                grid-template-columns: 1fr;
+                gap: 16px;
+            }
+            
+            .summary-card {
+                padding: 24px;
+            }
+            
+            .section-header {
+                padding: 24px;
+            }
+            
+            .section-content {
+                padding: 24px;
+            }
+            
+            th, td {
+                padding: 12px 16px;
+                font-size: 0.9em;
+            }
+        }
+        
+        @media (max-width: 480px) {
+            .header h1 {
+                font-size: 2em;
+            }
+            
+            .header-info-item p {
+                font-size: 1.1em;
+                word-break: break-word;
+            }
+            
+            th, td {
+                padding: 8px 12px;
+                font-size: 0.85em;
+            }
+        }
+        
+        .error-message {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 10px 0;
+            border-left: 4px solid #dc3545;
+        }
+        
+        .info-message {
+            background: #d1ecf1;
+            color: #0c5460;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 10px 0;
+            border-left: 4px solid #17a2b8;
+        }
+        
+        @media print {
+            body {
+                background: white;
+            }
+            
+            .container {
+                max-width: none;
+                padding: 0;
+            }
+            
+            .summary-card, .section {
+                box-shadow: none;
+                border: 1px solid #dee2e6;
+            }
+            
+            .header {
+                background: #667eea !important;
+                -webkit-print-color-adjust: exact;
+            }
+        }
+        
+        @media (max-width: 768px) {
+            .header h1 {
+                font-size: 2em;
+            }
+            
+            .header-info {
+                grid-template-columns: 1fr;
+            }
+            
+            .summary {
+                grid-template-columns: 1fr;
+            }
+            
+            .detail-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        
+        /* Floating Go to Top Button */
+        .go-to-top {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            width: 50px;
+            height: 50px;
+            background: linear-gradient(135deg, #2c3e50 0%, #3498db 100%);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 18px;
+            font-weight: bold;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+            transition: all 0.3s ease;
+            z-index: 1000;
+            opacity: 0;
+            visibility: hidden;
+            transform: translateY(20px);
+        }
+        
+        .go-to-top.visible {
+            opacity: 1;
+            visibility: visible;
+            transform: translateY(0);
+        }
+        
+        .go-to-top:hover {
+            background: linear-gradient(135deg, #34495e 0%, #2980b9 100%);
+            transform: translateY(-2px);
+            box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
+        }
+        
+        .go-to-top:active {
+            transform: translateY(0);
+        }
+        
+        @media print {
+            .go-to-top {
+                display: none !important;
+            }
+        }
+        
+        /* Code block styling */
+        code {
+            background: linear-gradient(135deg, #f1f5f9 0%, #e2e8f0 100%);
+            color: #1e293b;
+            padding: 4px 8px;
+            border-radius: 6px;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            font-size: 0.85em;
+            border: 1px solid rgba(148, 163, 184, 0.3);
+            display: inline-block;
+            margin: 2px 0;
+            word-break: break-all;
+            white-space: pre-wrap;
+        }
+        
+        .code-block {
+            background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+            border: 1px solid rgba(148, 163, 184, 0.3);
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin: 8px 0;
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            font-size: 0.9em;
+            color: #1e293b;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+        }
+        
+        .recommendation code {
+            background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
+            border-color: rgba(245, 158, 11, 0.3);
+        }
+        
+        .recommendation.critical code {
+            background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%);
+            border-color: rgba(239, 68, 68, 0.3);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>ocp - Health Report</h1>
+            <div class="header-info">
+                <div class="header-info-item">
+                    <h3>Cluster Name</h3>
+                    <p>ocp</p>
+                </div>
+                <div class="header-info-item">
+                    <h3>Cluster Version</h3>
+                    <p>4.18.22</p>
+                </div>
+                <div class="header-info-item">
+                    <h3>Cluster Channel</h3>
+                    <p>stable-4.18</p>
+                </div>
+                <div class="header-info-item">
+                    <h3>Kubernetes Version</h3>
+                    <p>v1.31.11</p>
+                </div>
+                <div class="header-info-item">
+                    <h3>Cluster UUID</h3>
+                    <p>8f57920f-a085-4650-b0e1-ec0de531c8fc</p>
+                </div>
+                <div class="header-info-item">
+                    <h3>Node Count</h3>
+                    <p>6</p>
+                </div>
+            </div>
+        </div>
+        <div class="summary">
+            <a href="#fips-section" class="summary-card critical">
+                <h3>FIPS Compliance</h3>
+                <p><span class="status-indicator status-critical">critical</span></p>
+                <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                    0/6 nodes compliant
+                </p>
+            </a>
+            <a href="#ntp-section" class="summary-card healthy">
+                <h3>NTP Synchronization</h3>
+                <p><span class="status-indicator status-healthy">healthy</span></p>
+                <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                    6/6 nodes synchronized
+                </p>
+            </a>
+            <a href="#etcd-section" class="summary-card critical">
+                <h3>etcd Encryption</h3>
+                <p><span class="status-indicator status-critical">critical</span></p>
+                <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                    Encryption: false
+                </p>
+            </a>
+            <a href="#oauth-section" class="summary-card warning">
+                <h3>OAuth Authentication</h3>
+                <p><span class="status-indicator status-warning">warning</span></p>
+                <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                    0 provider(s) configured
+                </p>
+            </a>
+            <a href="#cluster-operators-section" class="summary-card healthy">
+                <h3>Cluster Operators</h3>
+                <p><span class="status-indicator status-healthy">healthy</span></p>
+                <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                    34/34 available
+                </p>
+            </a>
+            <a href="#alertmanager-section" class="summary-card warning">
+                <h3>AlertManager</h3>
+                <p><span class="status-indicator status-warning">warning</span></p>
+                <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                    2/2 pods healthy
+                </p>
+            </a>
+            <a href="#loki-section" class="summary-card critical">
+                <h3>Loki Logging</h3>
+                <p><span class="status-indicator status-critical">critical</span></p>
+                <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                    0/0 pods healthy
+                </p>
+            </a>
+            <a href="#ipsec-section" class="summary-card warning">
+                <h3>IPSec Encryption</h3>
+                <p><span class="status-indicator status-warning">warning</span></p>
+                <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                    Disabled
+                </p>
+            </a>
+            <a href="#backup-section" class="summary-card warning">
+                <h3>Cluster Backup</h3>
+                <p><span class="status-indicator status-warning">warning</span></p>
+                <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                    Configured
+                </p>
+            </a>
+            <a href="#ingress-section" class="summary-card healthy">
+                <h3>Ingress Controller</h3>
+                <p><span class="status-indicator status-healthy">healthy</span></p>
+                <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                    3/3 replicas ready
+                </p>
+            </a>
+            <a href="#node-details-section" class="summary-card healthy">
+                <h3>Node Details</h3>
+                <p><span class="status-indicator status-healthy">healthy</span></p>
+                <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                    6/6 nodes ready
+                </p>
+            </a>
+        </div>
+        <div class="section" id="fips-section">
+            <div class="section-header">
+                <h2>FIPS Compliance Status</h2>
+                <p>Federal Information Processing Standards compliance across cluster nodes</p>
+            </div>
+            <div class="section-content">
+                <div class="info-message">
+                    <strong>Overall Status:</strong> <span class="status-indicator status-critical">FIPS compliance failed: 6 of 6 nodes are not FIPS compliant</span>
+                </div>
+                
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Metric</th>
+                                <th>Value</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Total Nodes</td>
+                                <td>6</td>
+                            </tr>
+                            <tr>
+                                <td>Compliant Nodes</td>
+                                <td>0</td>
+                            </tr>
+                            <tr>
+                                <td>Non-Compliant Nodes</td>
+                                <td>6</td>
+                            </tr>
+                            <tr>
+                                <td>Unknown Status Nodes</td>
+                                <td>0</td>
+                            </tr>
+                            <tr>
+                                <td>Check Timestamp</td>
+                                <td>2025-09-05T19:21:52Z</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Detailed FIPS Node Status</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Node Name</th>
+                                <th>FIPS Status</th>
+                                <th>Message</th>
+                                <th>OS Image</th>
+                                <th>Check Timestamp</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+<tr><td><strong>master01</strong></td><td><span class="status-indicator status-critical">Disabled</span></td><td>FIPS mode disabled (verified from /proc/sys/crypto/fips_enabled)</td><td>Red Hat Enterprise Linux CoreOS 418.94.20250806...</td><td>2025-09-05T19:21:54Z</td></tr>
+<tr><td><strong>master02</strong></td><td><span class="status-indicator status-critical">Disabled</span></td><td>FIPS mode disabled (verified from /proc/sys/crypto/fips_enabled)</td><td>Red Hat Enterprise Linux CoreOS 418.94.20250806...</td><td>2025-09-05T19:21:56Z</td></tr>
+<tr><td><strong>master03</strong></td><td><span class="status-indicator status-critical">Disabled</span></td><td>FIPS mode disabled (verified from /proc/sys/crypto/fips_enabled)</td><td>Red Hat Enterprise Linux CoreOS 418.94.20250806...</td><td>2025-09-05T19:21:57Z</td></tr>
+<tr><td><strong>worker01</strong></td><td><span class="status-indicator status-critical">Disabled</span></td><td>FIPS mode disabled (verified from /proc/sys/crypto/fips_enabled)</td><td>Red Hat Enterprise Linux CoreOS 418.94.20250806...</td><td>2025-09-05T19:21:59Z</td></tr>
+<tr><td><strong>worker02</strong></td><td><span class="status-indicator status-critical">Disabled</span></td><td>FIPS mode disabled (verified from /proc/sys/crypto/fips_enabled)</td><td>Red Hat Enterprise Linux CoreOS 418.94.20250806...</td><td>2025-09-05T19:22:00Z</td></tr>
+<tr><td><strong>worker03</strong></td><td><span class="status-indicator status-critical">Disabled</span></td><td>FIPS mode disabled (verified from /proc/sys/crypto/fips_enabled)</td><td>Red Hat Enterprise Linux CoreOS 418.94.20250806...</td><td>2025-09-05T19:22:02Z</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+            </div>
+        </div>
+        <div class="section" id="ntp-section">
+            <div class="section-header">
+                <h2>NTP Synchronization Status</h2>
+                <p>Network Time Protocol synchronization across cluster nodes</p>
+            </div>
+            <div class="section-content">
+                <div class="info-message">
+                    <strong>Overall Status:</strong> <span class="status-indicator status-healthy">All nodes are properly synchronized with NTP</span>
+                </div>
+                
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Metric</th>
+                                <th>Value</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Total Nodes</td>
+                                <td>6</td>
+                            </tr>
+                            <tr>
+                                <td>Synchronized Nodes</td>
+                                <td>6</td>
+                            </tr>
+                            <tr>
+                                <td>Unsynchronized Nodes</td>
+                                <td>0</td>
+                            </tr>
+                            <tr>
+                                <td>Unknown Status Nodes</td>
+                                <td>0</td>
+                            </tr>
+                            <tr>
+                                <td>Check Timestamp</td>
+                                <td>2025-09-05T19:22:02Z</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+            </div>
+        </div>
+        <div class="section" id="etcd-section">
+            <div class="section-header">
+                <h2>etcd Encryption Status</h2>
+                <p>etcd encryption configuration and key rotation status</p>
+            </div>
+            <div class="section-content">
+                <div class="info-message">
+                    <strong>Overall Status:</strong> <span class="status-indicator status-critical">etcd encryption is not enabled</span>
+                </div>
+                
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Metric</th>
+                                <th>Value</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Encryption Enabled</td>
+                                <td>false</td>
+                            </tr>
+                            <tr>
+                                <td>Encryption Type</td>
+                                <td>none</td>
+                            </tr>
+                            <tr>
+                                <td>Encryption Provider</td>
+                                <td>No encryption configured</td>
+                            </tr>
+
+                            <tr>
+                                <td>Key Rotation Status</td>
+                                <td>unknown</td>
+                            </tr>
+                            <tr>
+                                <td>Last Key Rotation</td>
+                                <td>unknown</td>
+                            </tr>
+                            <tr>
+                                <td>Healthy etcd Pods</td>
+                                <td>3/3</td>
+                            </tr>
+                            <tr>
+                                <td>Check Timestamp</td>
+                                <td>2025-09-05T19:22:23Z</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <div class="error-message">
+                    <strong>Errors:</strong> Key rotation check: Failed to retrieve etcd operator logs
+                </div>
+            </div>
+        </div>
+        <div class="section" id="oauth-section">
+            <div class="section-header">
+                <h2>OAuth Authentication</h2>
+                <p>OpenShift OAuth authentication configuration and identity providers</p>
+            </div>
+            <div class="section-content">
+                <div class="info-message">
+                    <strong>Overall Status:</strong> <span class="status-indicator status-warning">No identity providers configured - using default authentication</span>
+                </div>
+                
+                <h3 style="margin: 20px 0 15px 0; color: #495057;">Summary</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Metric</th>
+                                <th>Value</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>OAuth Configured</td>
+                                <td>false</td>
+                            </tr>
+                            <tr>
+                                <td>Identity Providers Count</td>
+                                <td>0</td>
+                            </tr>
+                            <tr>
+                                <td>Provider Types</td>
+                                <td>None</td>
+                            </tr>
+                            <tr>
+                                <td>OAuth Pods Healthy</td>
+                                <td>3/3</td>
+                            </tr>
+                            <tr>
+                                <td>Check Timestamp</td>
+                                <td>2025-09-05T19:22:28Z</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <div class="info-message">
+                    <strong>Note:</strong> No detailed identity provider information available or no providers configured.
+                </div>
+            </div>
+        </div>
+        <div class="section" id="cluster-operators-section">
+            <div class="section-header">
+                <h2>Cluster Operators Status</h2>
+                <p>OpenShift cluster operators health and availability</p>
+            </div>
+            <div class="section-content">
+                <div class="info-message">
+                    <strong>Overall Status:</strong> <span class="status-indicator status-healthy">All 34 cluster operators are available</span>
+                </div>
+                
+                <h3 style="margin: 20px 0 15px 0; color: #495057;">Summary</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Metric</th>
+                                <th>Value</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Total Operators</td>
+                                <td>34</td>
+                            </tr>
+                            <tr>
+                                <td>Available Operators</td>
+                                <td>34</td>
+                            </tr>
+                            <tr>
+                                <td>Progressing Operators</td>
+                                <td>0</td>
+                            </tr>
+                            <tr>
+                                <td>Degraded Operators</td>
+                                <td>0</td>
+                            </tr>
+                            <tr>
+                                <td>Check Timestamp</td>
+                                <td>2025-09-05T19:22:28Z</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Detailed Operator Status</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Operator Name</th>
+                                <th>Status</th>
+                                <th>Available</th>
+                                <th>Progressing</th>
+                                <th>Degraded</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+<tr><td><strong>authentication</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>baremetal</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>cloud-controller-manager</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>cloud-credential</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>cluster-autoscaler</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>config-operator</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>console</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>control-plane-machine-set</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>csi-snapshot-controller</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>dns</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>etcd</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>image-registry</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>ingress</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>insights</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>kube-apiserver</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>kube-controller-manager</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>kube-scheduler</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>kube-storage-version-migrator</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>machine-api</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>machine-approver</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>machine-config</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>marketplace</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>monitoring</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>network</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>node-tuning</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>olm</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>openshift-apiserver</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>openshift-controller-manager</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>openshift-samples</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>operator-lifecycle-manager</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>operator-lifecycle-manager-catalog</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>operator-lifecycle-manager-packageserver</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>service-ca</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+<tr><td><strong>storage</strong></td><td><span class="status-indicator status-healthy">healthy</span></td><td>True</td><td>False</td><td>False</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <div class="section" id="alertmanager-section">
+            <div class="section-header">
+                <h2>AlertManager Status</h2>
+                <p>AlertManager deployment and receiver configuration</p>
+            </div>
+            <div class="section-content">
+                <div class="info-message">
+                    <strong>Overall Status:</strong> <span class="status-indicator status-warning">AlertManager is running but no alert receivers are configured</span>
+                </div>
+                
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Metric</th>
+                                <th>Value</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Deployment Status</td>
+                                <td>healthy</td>
+                            </tr>
+                            <tr>
+                                <td>Total Pods</td>
+                                <td>2</td>
+                            </tr>
+                            <tr>
+                                <td>Healthy Pods</td>
+                                <td>2</td>
+                            </tr>
+                            <tr>
+                                <td>Alert Receivers Configured</td>
+                                <td>false</td>
+                            </tr>
+                            <tr>
+                                <td>Receiver Details</td>
+                                <td>No alert receivers configured (only default null receiver)</td>
+                            </tr>
+                            <tr>
+                                <td>Number of Receivers</td>
+                                <td>0</td>
+                            </tr>
+                            <tr>
+                                <td>Routes Configured</td>
+                                <td>0
+0</td>
+                            </tr>
+                            <tr>
+                                <td>Check Timestamp</td>
+                                <td>2025-09-05T19:22:33Z</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+            </div>
+        </div>
+        <div class="section" id="loki-section">
+            <div class="section-header">
+                <h2>Loki Logging Status</h2>
+                <p>Loki deployment and tenant configuration (audit, infrastructure, application)</p>
+            </div>
+            <div class="section-content">
+                <div class="info-message">
+                    <strong>Overall Status:</strong> <span class="status-indicator status-critical">OpenShift Logging namespace not found</span>
+                </div>
+                
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Metric</th>
+                                <th>Value</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Deployment Status</td>
+                                <td>not_found</td>
+                            </tr>
+                            <tr>
+                                <td>Total Pods</td>
+                                <td>0</td>
+                            </tr>
+                            <tr>
+                                <td>Healthy Pods</td>
+                                <td>0</td>
+                            </tr>
+                            <tr>
+                                <td>Audit Tenant</td>
+                                <td>unknown</td>
+                            </tr>
+                            <tr>
+                                <td>Infrastructure Tenant</td>
+                                <td>unknown</td>
+                            </tr>
+                            <tr>
+                                <td>Application Tenant</td>
+                                <td>unknown</td>
+                            </tr>
+                            <tr>
+                                <td>LokiStack Configured</td>
+                                <td>unknown</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Tenant Retention Configuration</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Tenant</th>
+                                <th>Status</th>
+                                <th>Retention Period</th>
+                                <th>Description</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>Audit</strong></td>
+                                <td><span class="status-indicator status-unknown">Unknown</span></td>
+                                <td><span class="status-indicator status-unknown">Unknown</span></td>
+                                <td>Kubernetes API server audit logs</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Infrastructure</strong></td>
+                                <td><span class="status-indicator status-unknown">Unknown</span></td>
+                                <td><span class="status-indicator status-unknown">Unknown</span></td>
+                                <td>OpenShift infrastructure component logs</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Application</strong></td>
+                                <td><span class="status-indicator status-unknown">Unknown</span></td>
+                                <td><span class="status-indicator status-unknown">Unknown</span></td>
+                                <td>Application and user workload logs</td>
+                            </tr>
+                            <tr>
+                                <td>Check Timestamp</td>
+                                <td>2025-09-05T19:22:33Z</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">LokiStack Components</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Component</th>
+                                <th>Status</th>
+                                <th>Description</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>Compactor</strong></td>
+                                <td><span class="status-indicator status-unknown">Unknown</span></td>
+                                <td>Compacts and deduplicates log data</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Distributor</strong></td>
+                                <td><span class="status-indicator status-unknown">Unknown</span></td>
+                                <td>Receives and distributes log streams</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Gateway</strong></td>
+                                <td><span class="status-indicator status-unknown">Unknown</span></td>
+                                <td>API gateway for Loki services</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Index Gateway</strong></td>
+                                <td><span class="status-indicator status-unknown">Unknown</span></td>
+                                <td>Serves index queries and downloads</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Ingester</strong></td>
+                                <td><span class="status-indicator status-unknown">Unknown</span></td>
+                                <td>Ingests and stores log data</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Querier</strong></td>
+                                <td><span class="status-indicator status-unknown">Unknown</span></td>
+                                <td>Executes log queries</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Query Frontend</strong></td>
+                                <td><span class="status-indicator status-unknown">Unknown</span></td>
+                                <td>Frontend for query processing and caching</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Ruler</strong></td>
+                                <td><span class="status-indicator status-unknown">Unknown</span></td>
+                                <td>Evaluates recording and alerting rules</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Collector</strong></td>
+                                <td><span class="status-indicator status-unknown">Unknown</span></td>
+                                <td>Collects and forwards logs from nodes (Fluentd/Vector)</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <div class="error-message">
+                    <strong>Errors:</strong> OpenShift Logging operator not installed (openshift-logging namespace missing)
+                </div>
+            </div>
+        </div>
+        <div class="section" id="ipsec-section">
+            <div class="section-header">
+                <h2>IPSec Encryption Status</h2>
+                <p>IPSec encryption for pod-to-pod and node-to-node communication</p>
+            </div>
+            <div class="section-content">
+                <div class="info-message">
+                    <strong>Overall Status:</strong> <span class="status-indicator status-warning">IPSec encryption is explicitly disabled (mode: Disabled) - pod-to-pod traffic is not encrypted</span>
+                </div>
+                
+                <h3 style="margin: 20px 0 15px 0; color: #495057;">Summary</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Metric</th>
+                                <th>Value</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>IPSec Enabled</td>
+                                <td><span class="status-indicator status-warning">No</span></td>
+                            </tr>
+                            <tr>
+                                <td>IPSec Mode</td>
+                                <td>Disabled</td>
+                            </tr>
+
+                            <tr>
+                                <td>IPSec Pods Healthy</td>
+                                <td>0/0</td>
+                            </tr>
+                            <tr>
+                                <td>Check Timestamp</td>
+                                <td>2025-09-05T19:22:33Z</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">IPSec Configuration Details</h3>
+                <div class="info-message">
+                    <strong>Network Encryption:</strong> 
+                    IPSec encryption is not enabled. Network traffic within the cluster is not encrypted at the network layer. Consider enabling IPSec for enhanced security in production environments.
+                </div>
+                
+                <div class="info-message">
+                    <strong>Security Benefits:</strong>
+                    <ul style="margin: 10px 0; padding-left: 20px;">
+                        <li><strong>Pod-to-Pod Encryption:</strong> Encrypts traffic between pods across different nodes</li>
+                        <li><strong>Node-to-Node Encryption:</strong> Secures communication between cluster nodes</li>
+                        <li><strong>Network Layer Security:</strong> Provides encryption at the network layer (Layer 3)</li>
+                        <li><strong>Compliance:</strong> Helps meet security compliance requirements for data in transit</li>
+                    </ul>
+                </div>
+                
+            </div>
+        </div>
+        <div class="section" id="backup-section">
+            <div class="section-header">
+                <h2>Cluster Backup Status</h2>
+                <p>Backup configurations and disaster recovery readiness</p>
+            </div>
+            <div class="section-content">
+                <div class="info-message">
+                    <strong>Overall Status:</strong> <span class="status-indicator status-warning">OADP operator not installed - consider installing for comprehensive backup solution</span>
+                </div>
+                
+                <h3 style="margin: 20px 0 15px 0; color: #495057;">Backup Solutions Summary</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Backup Solution</th>
+                                <th>Status</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>etcd Backup</td>
+                                <td><span class="status-indicator status-healthy">Enabled</span></td>
+                                <td>No schedule configured</td>
+                            </tr>
+                            <tr>
+                                <td>OADP Operator</td>
+                                <td><span class="status-indicator status-warning">Not Installed</span></td>
+                                <td>OpenShift API for Data Protection</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Backup Infrastructure</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Component</th>
+                                <th>Count</th>
+                                <th>Description</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+
+                            <tr>
+                                <td>Recent Backup Failures</td>
+                                <td><span class="status-indicator status-healthy">0</span></td>
+                                <td>Failed backup operations requiring attention</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Backup Recommendations</h3>
+                <div class="info-message">
+                    <strong>Disaster Recovery Best Practices:</strong>
+                    <ul style="margin: 10px 0; padding-left: 20px;">
+                        <li><strong>etcd Backup:</strong> Essential for cluster state recovery - should be automated and tested regularly</li>
+                        <li><strong>Application Data:</strong> Use OADP for persistent volume and application backup</li>
+                        <li><strong>Multiple Solutions:</strong> Implement both etcd and application-level backups for comprehensive protection</li>
+                        <li><strong>Off-site Storage:</strong> Store backups in geographically separate locations</li>
+                        <li><strong>Regular Testing:</strong> Periodically test backup restoration procedures</li>
+                        <li><strong>Retention Policies:</strong> Configure appropriate backup retention based on compliance requirements</li>
+                    </ul>
+                </div>
+                
+            </div>
+        </div>
+        <div class="section" id="ingress-section">
+            <div class="section-header">
+                <h2>OpenShift Ingress</h2>
+                <p>Ingress controller configuration, replica count, and node placement analysis</p>
+            </div>
+            <div class="section-content">
+                <div class="info-message">
+                    <strong>Overall Status:</strong> <span class="status-indicator status-healthy">Ingress configuration is optimal</span>
+                </div>
+                
+                <div class="info-grid">
+                    <div class="info-card">
+                        <h3>Ingress Controller</h3>
+                        <div class="info-table">
+                            <table>
+                                <tr>
+                                    <td>Controller Status</td>
+                                    <td><span class="status-indicator status-healthy">Configured</span></td>
+                                </tr>
+                                <tr>
+                                    <td>Desired Replicas</td>
+                                    <td>3</td>
+                                </tr>
+                                <tr>
+                                    <td>Current Replicas</td>
+                                    <td>3</td>
+                                </tr>
+                                <tr>
+                                    <td>Ready Replicas</td>
+                                    <td><span class="status-indicator status-healthy">3/3</span></td>
+                                </tr>
+                            </table>
+                        </div>
+                    </div>
+                    
+                    <div class="info-card">
+                        <h3>Node Placement</h3>
+                        <div class="info-table">
+                            <table>
+                                <tr>
+                                    <td>Placement Configuration</td>
+                                    <td><span class="status-indicator status-healthy">Fine (Running on Infra)</span></td>
+                                </tr>
+                                <tr>
+                                    <td>Running on Infra Nodes</td>
+                                    <td><span class="status-indicator status-healthy">3</span></td>
+                                </tr>
+                                <tr>
+                                    <td>Running on Worker Nodes</td>
+                                    <td><span class="status-indicator status-neutral">0</span></td>
+                                </tr>
+                                <tr>
+                                    <td>Pod Distribution</td>
+                                    <td><span class="status-indicator status-healthy">Well Distributed</span></td>
+                                </tr>
+                            </table>
+                        </div>
+                    </div>
+                    
+                    <div class="info-card">
+                        <h3>Cluster Node Availability</h3>
+                        <div class="info-table">
+                            <table>
+                                <tr>
+                                    <td>Infra Nodes Available</td>
+                                    <td><span class="status-indicator status-healthy">3</span></td>
+                                </tr>
+                                <tr>
+                                    <td>Worker Nodes Available</td>
+                                    <td><span class="status-indicator status-neutral">0</span></td>
+                                </tr>
+                                <tr>
+                                    <td>Minimum Replicas Status</td>
+                                    <td><span class="status-indicator status-healthy">Adequate for HA</span></td>
+                                </tr>
+                            </table>
+                        </div>
+                    </div>
+                    
+                    <div class="info-card">
+                        <h3>Recommendations</h3>
+                        <div class="recommendations">
+                            <div class="recommendation info">
+                                <strong>Info:</strong> Consider configuring explicit node placement for ingress pods
+                            </div>
+                            <div class="recommendation success">
+                                <strong>Good:</strong> Ingress configuration follows best practices
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="info-card">
+                    <h3>Check Details</h3>
+                    <div class="info-table">
+                        <table>
+                            <tr>
+                                <td>Check Timestamp</td>
+                                <td>2025-09-05T19:22:38Z</td>
+                            </tr>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="section" id="node-details-section">
+            <div class="section-header">
+                <h2>Node Details</h2>
+                <p>Comprehensive information about cluster nodes including roles, IP addresses, and system details</p>
+            </div>
+            <div class="section-content">
+                <div class="info-message">
+                    <strong>Overall Status:</strong> <span class="status-indicator status-healthy">All 6 nodes are ready</span>
+                </div>
+                
+                <h3 style="margin: 20px 0 15px 0; color: #495057;">Summary</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Metric</th>
+                                <th>Value</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Total Nodes</td>
+                                <td>6</td>
+                            </tr>
+                            <tr>
+                                <td>Master Nodes</td>
+                                <td>3</td>
+                            </tr>
+                            <tr>
+                                <td>Worker Nodes</td>
+                                <td>3</td>
+                            </tr>
+                            <tr>
+                                <td>Infra Nodes</td>
+                                <td>3</td>
+                            </tr>
+                            <tr>
+                                <td>Ready Nodes</td>
+                                <td>6</td>
+                            </tr>
+                            <tr>
+                                <td>Not Ready Nodes</td>
+                                <td>0</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Machine Config Pools</h3>
+                <div class="table-container">
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Status</th>
+<th>Ready</th>
+<th>Updated</th>
+<th>Degraded</th>
+<th>Total</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>master</strong></td>
+<td><span class="status-indicator status-healthy">Ready</span></td>
+<td>3</td>
+<td>3</td>
+<td>0</td>
+<td>3</td>
+</tr>
+<tr>
+<td><strong>worker</strong></td>
+<td><span class="status-indicator status-healthy">Ready</span></td>
+<td>3</td>
+<td>3</td>
+<td>0</td>
+<td>3</td>
+</tr>
+</tbody>
+</table>
+</div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Summary</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Metric</th>
+                                <th>Value</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Check Timestamp</td>
+                                <td>2025-09-05T19:22:39Z</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Detailed Node Information</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Node Name</th>
+                                <th>Roles</th>
+                                <th>Status</th>
+                                <th>Internal IP</th>
+                                <th>Memory Pressure</th>
+                                <th>Disk Pressure</th>
+                                <th>PID Pressure</th>
+                                <th>OS Image</th>
+                                <th>Taints</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+<tr><td><strong>master01</strong></td><td>master</td><td><span class="status-indicator status-healthy">Ready</span></td><td>192.168.8.201</td><td><span class="status-indicator status-healthy">False</span></td><td><span class="status-indicator status-healthy">False</span></td><td><span class="status-indicator status-healthy">False</span></td><td>Red Hat Enterprise Linux CoreOS 418.94.20250806...</td><td><span class="status-indicator status-warning">node-role.kubernetes.io/master:NoSchedule</span></td></tr>
+<tr><td><strong>master02</strong></td><td>master</td><td><span class="status-indicator status-healthy">Ready</span></td><td>192.168.8.202</td><td><span class="status-indicator status-healthy">False</span></td><td><span class="status-indicator status-healthy">False</span></td><td><span class="status-indicator status-healthy">False</span></td><td>Red Hat Enterprise Linux CoreOS 418.94.20250806...</td><td><span class="status-indicator status-warning">node-role.kubernetes.io/master:NoSchedule</span></td></tr>
+<tr><td><strong>master03</strong></td><td>master</td><td><span class="status-indicator status-healthy">Ready</span></td><td>192.168.8.203</td><td><span class="status-indicator status-healthy">False</span></td><td><span class="status-indicator status-healthy">False</span></td><td><span class="status-indicator status-healthy">False</span></td><td>Red Hat Enterprise Linux CoreOS 418.94.20250806...</td><td><span class="status-indicator status-warning">node-role.kubernetes.io/master:NoSchedule</span></td></tr>
+<tr><td><strong>worker01</strong></td><td>worker,infra</td><td><span class="status-indicator status-healthy">Ready</span></td><td>192.168.8.204</td><td><span class="status-indicator status-healthy">False</span></td><td><span class="status-indicator status-healthy">False</span></td><td><span class="status-indicator status-healthy">False</span></td><td>Red Hat Enterprise Linux CoreOS 418.94.20250806...</td><td><span class="status-indicator status-healthy">None</span></td></tr>
+<tr><td><strong>worker02</strong></td><td>worker,infra</td><td><span class="status-indicator status-healthy">Ready</span></td><td>192.168.8.205</td><td><span class="status-indicator status-healthy">False</span></td><td><span class="status-indicator status-healthy">False</span></td><td><span class="status-indicator status-healthy">False</span></td><td>Red Hat Enterprise Linux CoreOS 418.94.20250806...</td><td><span class="status-indicator status-healthy">None</span></td></tr>
+<tr><td><strong>worker03</strong></td><td>worker,infra</td><td><span class="status-indicator status-healthy">Ready</span></td><td>192.168.8.206</td><td><span class="status-indicator status-healthy">False</span></td><td><span class="status-indicator status-healthy">False</span></td><td><span class="status-indicator status-healthy">False</span></td><td>Red Hat Enterprise Linux CoreOS 418.94.20250806...</td><td><span class="status-indicator status-healthy">None</span></td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Node Resource Capacity</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Node Name</th>
+                                <th>CPU Capacity</th>
+                                <th>Memory Capacity</th>
+                                <th>Pods Capacity</th>
+                                <th>Architecture</th>
+                                <th>Container Runtime</th>
+                                <th>Kernel Version</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+<tr><td><strong>master01</strong></td><td>8</td><td>16 GB</td><td>250</td><td>amd64</td><td>cri-o://1.31.11-2.rhaos4.18...</td><td>5.14.0-427.81.1.el9_4.x86_64</td></tr>
+<tr><td><strong>master02</strong></td><td>8</td><td>16 GB</td><td>250</td><td>amd64</td><td>cri-o://1.31.11-2.rhaos4.18...</td><td>5.14.0-427.81.1.el9_4.x86_64</td></tr>
+<tr><td><strong>master03</strong></td><td>8</td><td>16 GB</td><td>250</td><td>amd64</td><td>cri-o://1.31.11-2.rhaos4.18...</td><td>5.14.0-427.81.1.el9_4.x86_64</td></tr>
+<tr><td><strong>worker01</strong></td><td>16</td><td>25 GB</td><td>250</td><td>amd64</td><td>cri-o://1.31.11-2.rhaos4.18...</td><td>5.14.0-427.81.1.el9_4.x86_64</td></tr>
+<tr><td><strong>worker02</strong></td><td>16</td><td>25 GB</td><td>250</td><td>amd64</td><td>cri-o://1.31.11-2.rhaos4.18...</td><td>5.14.0-427.81.1.el9_4.x86_64</td></tr>
+<tr><td><strong>worker03</strong></td><td>16</td><td>25 GB</td><td>250</td><td>amd64</td><td>cri-o://1.31.11-2.rhaos4.18...</td><td>5.14.0-427.81.1.el9_4.x86_64</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <div class="footer">
+            <p>Generated by OpenShift Health Report Generator v1.0.0</p>
+            <p>Report generated on 2025-09-05 22:22:42 +03</p>
+            <p>This report provides a snapshot of cluster health at the time of generation</p>
+            <p>© 2025 muneerkh@gmail.com</p>
+        </div>
+    </div>
+    
+    <!-- Floating Go to Top Button -->
+    <button class="go-to-top" id="goToTopBtn" onclick="scrollToTop()" title="Go to top">
+        ↑
+    </button>
+    
+    <script>
+        // Show/hide the go to top button based on scroll position
+        window.onscroll = function() {
+            var goToTopBtn = document.getElementById("goToTopBtn");
+            if (document.body.scrollTop > 300 || document.documentElement.scrollTop > 300) {
+                goToTopBtn.classList.add("visible");
+            } else {
+                goToTopBtn.classList.remove("visible");
+            }
+        };
+        
+        // Smooth scroll to top function
+        function scrollToTop() {
+            window.scrollTo({
+                top: 0,
+                behavior: 'smooth'
+            });
+        }
+    </script>
+</body>
+</html>

@@ -53,7 +53,7 @@ A comprehensive bash script that generates detailed HTML health reports for Open
 
 1. **Download the script**:
    ```bash
-   curl -O https://raw.githubusercontent.com/muneerkh/ocp-health-report/openshift-health-report.sh
+   curl -O https://raw.githubusercontent.com/muneerkh/ocp-health-report/refs/heads/main/openshift-health-report.sh
    chmod +x openshift-health-report.sh
    ```
 

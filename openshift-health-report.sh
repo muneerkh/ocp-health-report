@@ -719,7 +719,7 @@ format_duration() {
     echo "${result}"
 }
 
-# Format bytes to human readable format
+# Format bytes to human readable format using binary units (like OpenShift/Ceph)
 format_bytes() {
     local bytes="$1"
     
@@ -728,16 +728,43 @@ format_bytes() {
         return 1
     fi
     
-    local units=("B" "KB" "MB" "GB" "TB")
+    # Use binary units (1024-based) with proper IEC naming to match OpenShift/Ceph
+    local units=("B" "KiB" "MiB" "GiB" "TiB" "PiB")
     local unit_index=0
-    local size=${bytes}
+    local original_bytes=${bytes}
     
-    while [[ ${size} -ge 1024 && ${unit_index} -lt $((${#units[@]} - 1)) ]]; do
-        size=$((size / 1024))
+    # Find the appropriate unit
+    while [[ ${bytes} -ge 1024 && ${unit_index} -lt $((${#units[@]} - 1)) ]]; do
+        bytes=$((bytes / 1024))
         ((unit_index++))
     done
     
-    echo "${size}${units[${unit_index}]}"
+    # For units GiB and above, calculate precise decimal representation
+    if [[ ${unit_index} -ge 3 ]]; then
+        # Use awk for floating point precision to match OpenShift display
+        local precise_value
+        case ${unit_index} in
+            3) # GiB
+                precise_value=$(awk "BEGIN {printf \"%.2f\", ${original_bytes}/1073741824}")
+                ;;
+            4) # TiB  
+                precise_value=$(awk "BEGIN {printf \"%.2f\", ${original_bytes}/1099511627776}")
+                ;;
+            5) # PiB
+                precise_value=$(awk "BEGIN {printf \"%.2f\", ${original_bytes}/1125899906842624}")
+                ;;
+            *)
+                precise_value="${bytes}"
+                ;;
+        esac
+        
+        # Remove trailing zeros and decimal point if not needed
+        precise_value=$(echo "${precise_value}" | sed 's/\.00$//' | sed 's/0$//')
+        echo "${precise_value}${units[${unit_index}]}"
+    else
+        # For smaller units, use integer values
+        echo "${bytes}${units[${unit_index}]}"
+    fi
 }
 
 # Convert Kubernetes memory format to GB
@@ -2897,6 +2924,342 @@ EOF
 }
 
 # =============================================================================
+# CERTIFICATE AUTHORITY STATUS MODULE
+# =============================================================================
+
+# Certificate authority status structure
+declare -A cert_authority_status=(
+    ["overall_status"]="${STATUS_UNKNOWN}"
+    ["overall_message"]=""
+    ["api_cert_issuer"]="unknown"
+    ["api_cert_subject"]="unknown"
+    ["api_cert_expiry"]="unknown"
+    ["api_cert_days_remaining"]="unknown"
+    ["api_cert_is_ca_signed"]="unknown"
+    ["ingress_cert_issuer"]="unknown"
+    ["ingress_cert_subject"]="unknown"
+    ["ingress_cert_expiry"]="unknown"
+    ["ingress_cert_days_remaining"]="unknown"
+    ["ingress_cert_is_ca_signed"]="unknown"
+    ["custom_ca_configured"]="unknown"
+    ["ca_bundle_configured"]="unknown"
+    ["proxy_ca_configured"]="unknown"
+    ["check_timestamp"]=""
+    ["details"]=""
+    ["errors"]=""
+)
+
+# Check certificate authority configuration for API and Ingress
+check_certificate_authority_status() {
+    log_info "Checking certificate authority configuration..."
+    
+    # Reset certificate authority status
+    cert_authority_status["overall_status"]="${STATUS_UNKNOWN}"
+    cert_authority_status["overall_message"]=""
+    cert_authority_status["api_cert_issuer"]="unknown"
+    cert_authority_status["api_cert_subject"]="unknown"
+    cert_authority_status["api_cert_expiry"]="unknown"
+    cert_authority_status["api_cert_days_remaining"]="unknown"
+    cert_authority_status["api_cert_is_ca_signed"]="unknown"
+    cert_authority_status["ingress_cert_issuer"]="unknown"
+    cert_authority_status["ingress_cert_subject"]="unknown"
+    cert_authority_status["ingress_cert_expiry"]="unknown"
+    cert_authority_status["ingress_cert_days_remaining"]="unknown"
+    cert_authority_status["ingress_cert_is_ca_signed"]="unknown"
+    cert_authority_status["custom_ca_configured"]="unknown"
+    cert_authority_status["ca_bundle_configured"]="unknown"
+    cert_authority_status["proxy_ca_configured"]="unknown"
+    cert_authority_status["check_timestamp"]="$(get_timestamp)"
+    cert_authority_status["details"]=""
+    cert_authority_status["errors"]=""
+    
+    local error_messages=()
+    
+    # Check API server certificate
+    log_debug "Checking API server certificate..."
+    local api_server_url=""
+    if api_server_url=$(oc whoami --show-server 2>/dev/null); then
+        log_debug "API server URL: ${api_server_url}"
+        
+        # Extract hostname from URL
+        local api_hostname
+        api_hostname=$(echo "${api_server_url}" | sed 's|https\?://||' | cut -d':' -f1)
+        
+        if [[ -n "${api_hostname}" ]]; then
+            # Get certificate information using openssl
+            local cert_info=""
+            if cert_info=$(echo | timeout 10 openssl s_client -connect "${api_hostname}:6443" -servername "${api_hostname}" 2>/dev/null | openssl x509 -noout -text 2>/dev/null); then
+                
+                # Extract issuer
+                local api_issuer
+                api_issuer=$(echo "${cert_info}" | grep "Issuer:" | sed 's/.*Issuer: //' | head -1)
+                cert_authority_status["api_cert_issuer"]="${api_issuer:-unknown}"
+                
+                # Extract subject
+                local api_subject
+                api_subject=$(echo "${cert_info}" | grep "Subject:" | sed 's/.*Subject: //' | head -1)
+                cert_authority_status["api_cert_subject"]="${api_subject:-unknown}"
+                
+                # Extract expiry date
+                local api_expiry
+                api_expiry=$(echo "${cert_info}" | grep "Not After" | sed 's/.*Not After : //' | head -1)
+                cert_authority_status["api_cert_expiry"]="${api_expiry:-unknown}"
+                
+                # Calculate days remaining
+                if [[ -n "${api_expiry}" && "${api_expiry}" != "unknown" ]]; then
+                    local expiry_epoch
+                    expiry_epoch=$(date -d "${api_expiry}" +%s 2>/dev/null || echo "0")
+                    local current_epoch
+                    current_epoch=$(date +%s)
+                    local days_remaining=$(( (expiry_epoch - current_epoch) / 86400 ))
+                    cert_authority_status["api_cert_days_remaining"]="${days_remaining}"
+                fi
+                
+                # Check if certificate is CA-signed (not self-signed)
+                local is_self_signed="false"
+                if echo "${cert_info}" | grep -q "Issuer.*Subject.*CN.*${api_hostname}"; then
+                    is_self_signed="true"
+                elif [[ "${api_issuer}" == "${api_subject}" ]]; then
+                    is_self_signed="true"
+                fi
+                
+                if [[ "${is_self_signed}" == "true" ]]; then
+                    cert_authority_status["api_cert_is_ca_signed"]="false"
+                else
+                    cert_authority_status["api_cert_is_ca_signed"]="true"
+                fi
+                
+                log_debug "API certificate issuer: ${api_issuer}"
+                log_debug "API certificate CA-signed: ${cert_authority_status["api_cert_is_ca_signed"]}"
+            else
+                error_messages+=("Failed to retrieve API server certificate information")
+            fi
+        else
+            error_messages+=("Failed to extract API server hostname")
+        fi
+    else
+        error_messages+=("Failed to get API server URL")
+    fi
+    
+    # Check Ingress certificate
+    log_debug "Checking Ingress certificate..."
+    local ingress_config=""
+    if ingress_config=$(execute_oc_json "get ingresscontroller default -n openshift-ingress-operator -o json" "Get ingress controller config" 1 2>/dev/null); then
+        
+        # Get ingress domain
+        local ingress_domain
+        ingress_domain=$(echo "${ingress_config}" | jq -r '.status.domain' 2>/dev/null || echo "unknown")
+        
+        if [[ -n "${ingress_domain}" && "${ingress_domain}" != "unknown" && "${ingress_domain}" != "null" ]]; then
+            # Try to get certificate from a sample ingress hostname
+            local sample_hostname="console-openshift-console.${ingress_domain}"
+            
+            # Get certificate information using openssl
+            local ingress_cert_info=""
+            if ingress_cert_info=$(echo | timeout 10 openssl s_client -connect "${sample_hostname}:443" -servername "${sample_hostname}" 2>/dev/null | openssl x509 -noout -text 2>/dev/null); then
+                
+                # Extract issuer
+                local ingress_issuer
+                ingress_issuer=$(echo "${ingress_cert_info}" | grep "Issuer:" | sed 's/.*Issuer: //' | head -1)
+                cert_authority_status["ingress_cert_issuer"]="${ingress_issuer:-unknown}"
+                
+                # Extract subject
+                local ingress_subject
+                ingress_subject=$(echo "${ingress_cert_info}" | grep "Subject:" | sed 's/.*Subject: //' | head -1)
+                cert_authority_status["ingress_cert_subject"]="${ingress_subject:-unknown}"
+                
+                # Extract expiry date
+                local ingress_expiry
+                ingress_expiry=$(echo "${ingress_cert_info}" | grep "Not After" | sed 's/.*Not After : //' | head -1)
+                cert_authority_status["ingress_cert_expiry"]="${ingress_expiry:-unknown}"
+                
+                # Calculate days remaining
+                if [[ -n "${ingress_expiry}" && "${ingress_expiry}" != "unknown" ]]; then
+                    local expiry_epoch
+                    expiry_epoch=$(date -d "${ingress_expiry}" +%s 2>/dev/null || echo "0")
+                    local current_epoch
+                    current_epoch=$(date +%s)
+                    local days_remaining=$(( (expiry_epoch - current_epoch) / 86400 ))
+                    cert_authority_status["ingress_cert_days_remaining"]="${days_remaining}"
+                fi
+                
+                # Check if certificate is CA-signed (not self-signed)
+                local is_self_signed="false"
+                if echo "${ingress_cert_info}" | grep -q "Issuer.*Subject.*CN.*${sample_hostname}"; then
+                    is_self_signed="true"
+                elif [[ "${ingress_issuer}" == "${ingress_subject}" ]]; then
+                    is_self_signed="true"
+                fi
+                
+                if [[ "${is_self_signed}" == "true" ]]; then
+                    cert_authority_status["ingress_cert_is_ca_signed"]="false"
+                else
+                    cert_authority_status["ingress_cert_is_ca_signed"]="true"
+                fi
+                
+                log_debug "Ingress certificate issuer: ${ingress_issuer}"
+                log_debug "Ingress certificate CA-signed: ${cert_authority_status["ingress_cert_is_ca_signed"]}"
+            else
+                error_messages+=("Failed to retrieve Ingress certificate information")
+            fi
+        else
+            error_messages+=("Failed to get ingress domain")
+        fi
+    else
+        error_messages+=("Failed to get ingress controller configuration")
+    fi
+    
+    # Check for custom CA bundle configuration
+    log_debug "Checking for custom CA bundle configuration..."
+    local proxy_config=""
+    if proxy_config=$(execute_oc_json "get proxy cluster -o json" "Get proxy configuration" 1 2>/dev/null); then
+        local trusted_ca
+        trusted_ca=$(echo "${proxy_config}" | jq -r '.spec.trustedCA.name' 2>/dev/null || echo "")
+        
+        if [[ -n "${trusted_ca}" && "${trusted_ca}" != "null" ]]; then
+            cert_authority_status["ca_bundle_configured"]="true"
+            cert_authority_status["proxy_ca_configured"]="true"
+            log_debug "Custom CA bundle configured: ${trusted_ca}"
+        else
+            cert_authority_status["ca_bundle_configured"]="false"
+            cert_authority_status["proxy_ca_configured"]="false"
+        fi
+    else
+        cert_authority_status["ca_bundle_configured"]="unknown"
+        cert_authority_status["proxy_ca_configured"]="unknown"
+    fi
+    
+    # Check for additional custom CA configuration
+    local additional_ca=""
+    if additional_ca=$(execute_oc_json "get configmap user-ca-bundle -n openshift-config -o json" "Get user CA bundle" 1 2>/dev/null); then
+        cert_authority_status["custom_ca_configured"]="true"
+        log_debug "Additional custom CA bundle found"
+    else
+        cert_authority_status["custom_ca_configured"]="false"
+    fi
+    
+    # Determine overall status
+    local overall_status="${STATUS_UNKNOWN}"
+    local overall_message=""
+    local warnings=()
+    
+    # Check certificate expiry warnings
+    if [[ "${cert_authority_status["api_cert_days_remaining"]}" =~ ^[0-9]+$ ]]; then
+        if [[ "${cert_authority_status["api_cert_days_remaining"]}" -lt 30 ]]; then
+            warnings+=("API certificate expires in ${cert_authority_status["api_cert_days_remaining"]} days")
+        fi
+    fi
+    
+    if [[ "${cert_authority_status["ingress_cert_days_remaining"]}" =~ ^[0-9]+$ ]]; then
+        if [[ "${cert_authority_status["ingress_cert_days_remaining"]}" -lt 30 ]]; then
+            warnings+=("Ingress certificate expires in ${cert_authority_status["ingress_cert_days_remaining"]} days")
+        fi
+    fi
+    
+    # Determine status based on certificate configuration
+    if [[ ${#error_messages[@]} -gt 0 ]]; then
+        overall_status="${STATUS_CRITICAL}"
+        overall_message="Failed to check certificate configuration"
+    elif [[ ${#warnings[@]} -gt 0 ]]; then
+        overall_status="${STATUS_WARNING}"
+        overall_message="Certificate expiry warnings detected"
+    elif [[ "${cert_authority_status["api_cert_is_ca_signed"]}" == "true" && "${cert_authority_status["ingress_cert_is_ca_signed"]}" == "true" ]]; then
+        overall_status="${STATUS_HEALTHY}"
+        overall_message="Both API and Ingress certificates are CA-signed"
+    elif [[ "${cert_authority_status["api_cert_is_ca_signed"]}" == "false" || "${cert_authority_status["ingress_cert_is_ca_signed"]}" == "false" ]]; then
+        overall_status="${STATUS_WARNING}"
+        overall_message="Self-signed certificates detected"
+    else
+        overall_status="${STATUS_UNKNOWN}"
+        overall_message="Certificate authority status could not be determined"
+    fi
+    
+    # Add warning details to message
+    if [[ ${#warnings[@]} -gt 0 ]]; then
+        overall_message="${overall_message}: $(IFS=", "; echo "${warnings[*]}")"
+    fi
+    
+    # Combine error messages
+    if [[ ${#error_messages[@]} -gt 0 ]]; then
+        cert_authority_status["errors"]=$(IFS="; "; echo "${error_messages[*]}")
+    fi
+    
+    # Create details JSON
+    local details_result
+    details_result=$(cat << EOF
+{
+    "api_certificate": {
+        "issuer": "${cert_authority_status["api_cert_issuer"]}",
+        "subject": "${cert_authority_status["api_cert_subject"]}",
+        "expiry": "${cert_authority_status["api_cert_expiry"]}",
+        "days_remaining": "${cert_authority_status["api_cert_days_remaining"]}",
+        "is_ca_signed": "${cert_authority_status["api_cert_is_ca_signed"]}"
+    },
+    "ingress_certificate": {
+        "issuer": "${cert_authority_status["ingress_cert_issuer"]}",
+        "subject": "${cert_authority_status["ingress_cert_subject"]}",
+        "expiry": "${cert_authority_status["ingress_cert_expiry"]}",
+        "days_remaining": "${cert_authority_status["ingress_cert_days_remaining"]}",
+        "is_ca_signed": "${cert_authority_status["ingress_cert_is_ca_signed"]}"
+    },
+    "ca_configuration": {
+        "custom_ca_configured": "${cert_authority_status["custom_ca_configured"]}",
+        "ca_bundle_configured": "${cert_authority_status["ca_bundle_configured"]}",
+        "proxy_ca_configured": "${cert_authority_status["proxy_ca_configured"]}"
+    }
+}
+EOF
+    )
+    cert_authority_status["details"]="${details_result}"
+    
+    # Update overall status
+    cert_authority_status["overall_status"]="${overall_status}"
+    cert_authority_status["overall_message"]="${overall_message}"
+    
+    return 0
+}
+
+# Get certificate authority status summary
+get_cert_authority_status_summary() {
+    local format="${1:-text}"
+    
+    case "${format}" in
+        "json")
+            cat << EOF
+{
+    "overall_status": "${cert_authority_status["overall_status"]}",
+    "overall_message": "${cert_authority_status["overall_message"]}",
+    "api_cert_issuer": "${cert_authority_status["api_cert_issuer"]}",
+    "api_cert_expiry": "${cert_authority_status["api_cert_expiry"]}",
+    "api_cert_days_remaining": "${cert_authority_status["api_cert_days_remaining"]}",
+    "api_cert_is_ca_signed": "${cert_authority_status["api_cert_is_ca_signed"]}",
+    "ingress_cert_issuer": "${cert_authority_status["ingress_cert_issuer"]}",
+    "ingress_cert_expiry": "${cert_authority_status["ingress_cert_expiry"]}",
+    "ingress_cert_days_remaining": "${cert_authority_status["ingress_cert_days_remaining"]}",
+    "ingress_cert_is_ca_signed": "${cert_authority_status["ingress_cert_is_ca_signed"]}",
+    "custom_ca_configured": "${cert_authority_status["custom_ca_configured"]}",
+    "ca_bundle_configured": "${cert_authority_status["ca_bundle_configured"]}",
+    "check_timestamp": "${cert_authority_status["check_timestamp"]}",
+    "errors": "${cert_authority_status["errors"]}"
+}
+EOF
+            ;;
+        "text"|*)
+            echo "Certificate Authority Status: ${cert_authority_status["overall_status"]}"
+            echo "Message: ${cert_authority_status["overall_message"]}"
+            echo "API Certificate Issuer: ${cert_authority_status["api_cert_issuer"]}"
+            echo "API Certificate CA-signed: ${cert_authority_status["api_cert_is_ca_signed"]}"
+            echo "Ingress Certificate Issuer: ${cert_authority_status["ingress_cert_issuer"]}"
+            echo "Ingress Certificate CA-signed: ${cert_authority_status["ingress_cert_is_ca_signed"]}"
+            echo "Custom CA Configured: ${cert_authority_status["custom_ca_configured"]}"
+            if [[ -n "${cert_authority_status["errors"]}" ]]; then
+                echo "Errors: ${cert_authority_status["errors"]}"
+            fi
+            ;;
+    esac
+}
+
+# =============================================================================
 # OAUTH AUTHENTICATION DETAILS MODULE
 # =============================================================================
 
@@ -3466,6 +3829,394 @@ EOF
 }
 
 # =============================================================================
+# UPDATE SERVICE STATUS MODULE
+# =============================================================================
+
+# Update service status structure
+declare -A update_service_status=(
+    ["overall_status"]="${STATUS_UNKNOWN}"
+    ["overall_message"]=""
+    ["update_service_configured"]="unknown"
+    ["update_service_operator_status"]="unknown"
+    ["update_service_pods"]="0"
+    ["healthy_update_service_pods"]="0"
+    ["cluster_version_operator_status"]="unknown"
+    ["current_version"]="unknown"
+    ["desired_version"]="unknown"
+    ["update_available"]="unknown"
+    ["update_channel"]="unknown"
+    ["update_server"]="unknown"
+    ["upstream_configured"]="unknown"
+    ["check_timestamp"]=""
+    ["details"]=""
+    ["errors"]=""
+)
+
+# Check OpenShift Update Service configuration
+check_update_service_status() {
+    log_info "Checking OpenShift Update Service configuration..."
+    
+    # Reset update service status
+    update_service_status["overall_status"]="${STATUS_UNKNOWN}"
+    update_service_status["overall_message"]=""
+    update_service_status["update_service_configured"]="unknown"
+    update_service_status["update_service_operator_status"]="unknown"
+    update_service_status["update_service_pods"]="0"
+    update_service_status["healthy_update_service_pods"]="0"
+    update_service_status["cluster_version_operator_status"]="unknown"
+    update_service_status["current_version"]="unknown"
+    update_service_status["desired_version"]="unknown"
+    update_service_status["update_available"]="unknown"
+    update_service_status["update_channel"]="unknown"
+    update_service_status["update_server"]="unknown"
+    update_service_status["upstream_configured"]="unknown"
+    update_service_status["environment_type"]="unknown"
+    update_service_status["check_timestamp"]="$(get_timestamp)"
+    update_service_status["details"]=""
+    update_service_status["errors"]=""
+    
+    local error_messages=()
+    local environment_type="unknown"
+    
+    # Check ClusterVersion resource
+    log_debug "Checking ClusterVersion resource..."
+    local cluster_version_json=""
+    if cluster_version_json=$(execute_oc_json "get clusterversion version -o json" "Get cluster version" 1 2>/dev/null); then
+        # Get current version
+        local current_version
+        current_version=$(echo "${cluster_version_json}" | jq -r '.status.desired.version' 2>/dev/null || echo "unknown")
+        update_service_status["current_version"]="${current_version}"
+        
+        # Get desired version
+        local desired_version
+        desired_version=$(echo "${cluster_version_json}" | jq -r '.spec.desiredUpdate.version // .status.desired.version' 2>/dev/null || echo "unknown")
+        update_service_status["desired_version"]="${desired_version}"
+        
+        # Get update channel
+        local update_channel
+        update_channel=$(echo "${cluster_version_json}" | jq -r '.spec.channel' 2>/dev/null || echo "unknown")
+        update_service_status["update_channel"]="${update_channel}"
+        
+        # Get upstream server
+        local upstream_server
+        upstream_server=$(echo "${cluster_version_json}" | jq -r '.spec.upstream' 2>/dev/null || echo "unknown")
+        update_service_status["update_server"]="${upstream_server}"
+        
+        # Determine environment type and upstream configuration
+        if [[ "${upstream_server}" != "null" && "${upstream_server}" != "unknown" && -n "${upstream_server}" ]]; then
+            update_service_status["upstream_configured"]="true"
+            if [[ "${upstream_server}" == *"api.openshift.com"* ]]; then
+                environment_type="connected"
+                log_debug "Detected connected environment using Red Hat update servers"
+            else
+                environment_type="custom_upstream"
+                log_debug "Detected custom upstream server: ${upstream_server}"
+            fi
+        else
+            # No explicit upstream configured - need to determine environment type
+            update_service_status["upstream_configured"]="default"
+            
+            # Check multiple indicators to determine if this is a connected environment
+            local is_connected=false
+            
+            # Check 1: Look for available updates (indicates connectivity to update servers)
+            local available_updates_count
+            available_updates_count=$(echo "${cluster_version_json}" | jq -r '.status.availableUpdates // [] | length' 2>/dev/null || echo "0")
+            if [[ "${available_updates_count}" -gt 0 ]]; then
+                is_connected=true
+                log_debug "Found ${available_updates_count} available updates - indicates connectivity"
+            fi
+            
+            # Check 2: Look for update history (indicates past successful update checks)
+            local update_history_count
+            update_history_count=$(echo "${cluster_version_json}" | jq -r '.status.history // [] | length' 2>/dev/null || echo "0")
+            if [[ "${update_history_count}" -gt 0 ]]; then
+                is_connected=true
+                log_debug "Found update history - indicates connectivity"
+            fi
+            
+            # Check 3: Check if cluster has standard update channel configured
+            if [[ "${update_channel}" == stable-* || "${update_channel}" == fast-* || "${update_channel}" == candidate-* ]]; then
+                is_connected=true
+                log_debug "Standard update channel configured: ${update_channel}"
+            fi
+            
+            # Check 4: Look for cluster connectivity status
+            local connectivity_status=""
+            if connectivity_status=$(execute_oc_json "get clusteroperator image-registry -o json" "Get image registry operator" 1 2>/dev/null); then
+                local registry_available
+                registry_available=$(echo "${connectivity_status}" | jq -r '.status.conditions[] | select(.type == "Available") | .status' 2>/dev/null || echo "unknown")
+                if [[ "${registry_available}" == "True" ]]; then
+                    is_connected=true
+                    log_debug "Image registry operator available - indicates connectivity"
+                fi
+            fi
+            
+            # Check 5: Look for proxy configuration
+            local proxy_config=""
+            if proxy_config=$(execute_oc_json "get proxy cluster -o json" "Get proxy config" 1 2>/dev/null); then
+                local http_proxy
+                local https_proxy
+                http_proxy=$(echo "${proxy_config}" | jq -r '.spec.httpProxy // empty' 2>/dev/null || echo "")
+                https_proxy=$(echo "${proxy_config}" | jq -r '.spec.httpsProxy // empty' 2>/dev/null || echo "")
+                
+                if [[ -n "${http_proxy}" || -n "${https_proxy}" ]]; then
+                    environment_type="proxied"
+                    log_debug "Detected proxied environment with proxy: ${http_proxy:-${https_proxy}}"
+                elif [[ "${is_connected}" == "true" ]]; then
+                    environment_type="connected"
+                    log_debug "Detected connected environment (default Red Hat update servers)"
+                else
+                    environment_type="air_gapped"
+                    log_debug "Detected air-gapped environment (no connectivity indicators)"
+                fi
+            else
+                if [[ "${is_connected}" == "true" ]]; then
+                    environment_type="connected"
+                    log_debug "Detected connected environment (default Red Hat update servers)"
+                else
+                    environment_type="air_gapped"
+                    log_debug "Detected air-gapped environment (no connectivity indicators)"
+                fi
+            fi
+        fi
+        
+        # Check cluster version operator status
+        local cvo_conditions
+        cvo_conditions=$(echo "${cluster_version_json}" | jq -r '.status.conditions[] | select(.type == "Available") | .status' 2>/dev/null || echo "unknown")
+        if [[ "${cvo_conditions}" == "True" ]]; then
+            update_service_status["cluster_version_operator_status"]="available"
+        else
+            update_service_status["cluster_version_operator_status"]="unavailable"
+        fi
+        
+        # Check for available updates
+        local available_updates
+        available_updates=$(echo "${cluster_version_json}" | jq -r '.status.availableUpdates // [] | length' 2>/dev/null || echo "0")
+        if [[ "${available_updates}" -gt 0 ]]; then
+            update_service_status["update_available"]="true"
+        else
+            update_service_status["update_available"]="false"
+        fi
+        
+        log_debug "Current version: ${current_version}, Channel: ${update_channel}, Upstream: ${upstream_server}"
+    else
+        error_messages+=("Failed to retrieve cluster version information")
+    fi
+    
+    # Check for Update Service Operator
+    log_debug "Checking Update Service Operator..."
+    local update_service_operator=""
+    if update_service_operator=$(execute_oc_json "get deployment -n openshift-update-service update-service-operator -o json" "Get update service operator" 1 2>/dev/null); then
+        local operator_replicas
+        local operator_ready_replicas
+        
+        operator_replicas=$(echo "${update_service_operator}" | jq -r '.spec.replicas' 2>/dev/null || echo "0")
+        operator_ready_replicas=$(echo "${update_service_operator}" | jq -r '.status.readyReplicas // 0' 2>/dev/null || echo "0")
+        
+        if [[ "${operator_ready_replicas}" -eq "${operator_replicas}" && "${operator_replicas}" -gt 0 ]]; then
+            update_service_status["update_service_operator_status"]="running"
+            update_service_status["update_service_configured"]="true"
+        else
+            update_service_status["update_service_operator_status"]="degraded"
+            update_service_status["update_service_configured"]="true"
+        fi
+        
+        log_debug "Update Service Operator: ${operator_ready_replicas}/${operator_replicas} replicas ready"
+    else
+        update_service_status["update_service_operator_status"]="not_installed"
+        update_service_status["update_service_configured"]="false"
+        log_debug "Update Service Operator not found"
+    fi
+    
+    # Check Update Service pods
+    log_debug "Checking Update Service pods..."
+    local update_service_pods=""
+    if update_service_pods=$(execute_oc_json "get pods -n openshift-update-service -o json" "Get update service pods" 1 2>/dev/null); then
+        local total_pods
+        local running_pods
+        
+        total_pods=$(echo "${update_service_pods}" | jq '.items | length' 2>/dev/null || echo "0")
+        running_pods=$(echo "${update_service_pods}" | jq '[.items[] | select(.status.phase == "Running")] | length' 2>/dev/null || echo "0")
+        
+        update_service_status["update_service_pods"]="${total_pods}"
+        update_service_status["healthy_update_service_pods"]="${running_pods}"
+        
+        log_debug "Update Service pods: ${running_pods}/${total_pods} running"
+    else
+        update_service_status["update_service_pods"]="0"
+        update_service_status["healthy_update_service_pods"]="0"
+    fi
+    
+    # Check for Cincinnati Update Service (alternative implementation)
+    if [[ "${update_service_status["update_service_configured"]}" == "false" ]]; then
+        log_debug "Checking for Cincinnati Update Service..."
+        local cincinnati_pods=""
+        if cincinnati_pods=$(execute_oc_json "get pods -A -l app=cincinnati -o json" "Get Cincinnati pods" 1 2>/dev/null); then
+            local cincinnati_count
+            cincinnati_count=$(echo "${cincinnati_pods}" | jq '.items | length' 2>/dev/null || echo "0")
+            
+            if [[ "${cincinnati_count}" -gt 0 ]]; then
+                update_service_status["update_service_configured"]="cincinnati"
+                local running_cincinnati
+                running_cincinnati=$(echo "${cincinnati_pods}" | jq '[.items[] | select(.status.phase == "Running")] | length' 2>/dev/null || echo "0")
+                
+                update_service_status["update_service_pods"]="${cincinnati_count}"
+                update_service_status["healthy_update_service_pods"]="${running_cincinnati}"
+                
+                log_debug "Cincinnati Update Service: ${running_cincinnati}/${cincinnati_count} pods running"
+            fi
+        fi
+    fi
+    
+    # Determine overall status based on environment type and configuration
+    local overall_status="${STATUS_UNKNOWN}"
+    local overall_message=""
+    
+    if [[ "${update_service_status["cluster_version_operator_status"]}" == "available" ]]; then
+        case "${environment_type}" in
+            "connected")
+                # Connected environment using Red Hat update servers (default or explicit)
+                overall_status="${STATUS_HEALTHY}"
+                if [[ "${update_service_status["upstream_configured"]}" == "true" ]]; then
+                    overall_message="Connected environment using Red Hat update servers"
+                else
+                    overall_message="Connected environment using default Red Hat update servers"
+                fi
+                ;;
+            "custom_upstream")
+                # Custom upstream server configured
+                overall_status="${STATUS_HEALTHY}"
+                overall_message="Using custom upstream server: ${update_service_status["update_server"]}"
+                ;;
+            "proxied")
+                # Proxied environment
+                if [[ "${update_service_status["upstream_configured"]}" == "true" || "${update_service_status["upstream_configured"]}" == "default" ]]; then
+                    overall_status="${STATUS_HEALTHY}"
+                    overall_message="Proxied environment with update server access"
+                else
+                    overall_status="${STATUS_WARNING}"
+                    overall_message="Proxied environment but no upstream server configured"
+                fi
+                ;;
+            "air_gapped")
+                # Air-gapped environment - check for local update service
+                if [[ "${update_service_status["update_service_configured"]}" == "true" ]]; then
+                    if [[ "${update_service_status["update_service_operator_status"]}" == "running" ]]; then
+                        overall_status="${STATUS_HEALTHY}"
+                        overall_message="Air-gapped environment with local Update Service running"
+                    else
+                        overall_status="${STATUS_WARNING}"
+                        overall_message="Air-gapped environment with Update Service configured but operator is ${update_service_status["update_service_operator_status"]}"
+                    fi
+                elif [[ "${update_service_status["update_service_configured"]}" == "cincinnati" ]]; then
+                    overall_status="${STATUS_HEALTHY}"
+                    overall_message="Air-gapped environment with Cincinnati Update Service running"
+                else
+                    overall_status="${STATUS_WARNING}"
+                    overall_message="Air-gapped environment without local update service - manual updates required"
+                fi
+                ;;
+            *)
+                # Unknown environment type
+                if [[ "${update_service_status["upstream_configured"]}" == "true" ]]; then
+                    overall_status="${STATUS_HEALTHY}"
+                    overall_message="Upstream server configured: ${update_service_status["update_server"]}"
+                elif [[ "${update_service_status["upstream_configured"]}" == "default" ]]; then
+                    overall_status="${STATUS_HEALTHY}"
+                    overall_message="Using default update server configuration"
+                elif [[ "${update_service_status["update_service_configured"]}" == "true" ]]; then
+                    overall_status="${STATUS_HEALTHY}"
+                    overall_message="Local Update Service configured"
+                else
+                    overall_status="${STATUS_WARNING}"
+                    overall_message="No update service or upstream server configured"
+                fi
+                ;;
+        esac
+    else
+        overall_status="${STATUS_CRITICAL}"
+        overall_message="Cluster Version Operator is not available"
+    fi
+    
+    # Add update availability information
+    if [[ "${update_service_status["update_available"]}" == "true" ]]; then
+        overall_message="${overall_message} - Updates available"
+    fi
+    
+    # Combine error messages
+    if [[ ${#error_messages[@]} -gt 0 ]]; then
+        update_service_status["errors"]=$(IFS="; "; echo "${error_messages[*]}")
+        if [[ "${overall_status}" == "${STATUS_UNKNOWN}" ]]; then
+            overall_status="${STATUS_CRITICAL}"
+            overall_message="Update service check failed"
+        fi
+    fi
+    
+    # Create details JSON
+    local details_result
+    details_result=$(cat << EOF
+{
+    "cluster_version": ${cluster_version_json:-"{}"},
+    "update_service_operator": ${update_service_operator:-"{}"},
+    "update_service_pods": ${update_service_pods:-"{}"}
+}
+EOF
+    )
+    update_service_status["details"]="${details_result}"
+    
+    # Update overall status
+    update_service_status["overall_status"]="${overall_status}"
+    update_service_status["overall_message"]="${overall_message}"
+    update_service_status["environment_type"]="${environment_type}"
+    
+    return 0
+}
+
+# Get update service status summary
+get_update_service_status_summary() {
+    local format="${1:-text}"
+    
+    case "${format}" in
+        "json")
+            cat << EOF
+{
+    "overall_status": "${update_service_status["overall_status"]}",
+    "overall_message": "${update_service_status["overall_message"]}",
+    "update_service_configured": "${update_service_status["update_service_configured"]}",
+    "update_service_operator_status": "${update_service_status["update_service_operator_status"]}",
+    "cluster_version_operator_status": "${update_service_status["cluster_version_operator_status"]}",
+    "current_version": "${update_service_status["current_version"]}",
+    "desired_version": "${update_service_status["desired_version"]}",
+    "update_available": "${update_service_status["update_available"]}",
+    "update_channel": "${update_service_status["update_channel"]}",
+    "update_server": "${update_service_status["update_server"]}",
+    "upstream_configured": "${update_service_status["upstream_configured"]}",
+    "environment_type": "${update_service_status["environment_type"]}",
+    "update_service_pods": "${update_service_status["update_service_pods"]}",
+    "healthy_update_service_pods": "${update_service_status["healthy_update_service_pods"]}",
+    "check_timestamp": "${update_service_status["check_timestamp"]}",
+    "errors": "${update_service_status["errors"]}"
+}
+EOF
+            ;;
+        "text"|*)
+            echo "Update Service Status: ${update_service_status["overall_status"]}"
+            echo "Message: ${update_service_status["overall_message"]}"
+            echo "Update Service Configured: ${update_service_status["update_service_configured"]}"
+            echo "Current Version: ${update_service_status["current_version"]}"
+            echo "Update Channel: ${update_service_status["update_channel"]}"
+            echo "Update Server: ${update_service_status["update_server"]}"
+            echo "Updates Available: ${update_service_status["update_available"]}"
+            echo "Healthy Pods: ${update_service_status["healthy_update_service_pods"]}/${update_service_status["update_service_pods"]}"
+            if [[ -n "${update_service_status["errors"]}" ]]; then
+                echo "Errors: ${update_service_status["errors"]}"
+            fi
+            ;;
+    esac
+}
+
+# =============================================================================
 # ALERTMANAGER STATUS MODULE
 # =============================================================================
 
@@ -3912,6 +4663,110 @@ EOF
     echo "${retention_result}"
 }
 
+# Check ClusterLogForwarder for Loki tenant configuration
+check_clusterlogforwarder_tenants() {
+    log_debug "Checking ClusterLogForwarder for Loki tenant configuration..."
+    
+    # Initialize tenant status
+    local audit_configured="not_configured"
+    local infrastructure_configured="not_configured"
+    local application_configured="not_configured"
+    
+    # Get ClusterLogForwarder in openshift-logging namespace
+    local clf_json=""
+    if clf_json=$(execute_oc_json "get clusterlogforwarder instance -n openshift-logging -o json" "Get ClusterLogForwarder" 1); then
+        if [[ -n "${clf_json}" && "${clf_json}" != "null" ]]; then
+            log_debug "ClusterLogForwarder found, checking pipelines..."
+            
+            # Check if there are pipelines with lokiStack outputs
+            local pipelines_count
+            pipelines_count=$(echo "${clf_json}" | jq '.spec.pipelines | length' 2>/dev/null || echo "0")
+            
+            if [[ "${pipelines_count}" -gt 0 ]]; then
+                log_debug "Found ${pipelines_count} pipelines in ClusterLogForwarder"
+                
+                # Check each pipeline for inputRefs
+                local pipeline_index=0
+                while [[ ${pipeline_index} -lt ${pipelines_count} ]]; do
+                    local input_refs
+                    input_refs=$(echo "${clf_json}" | jq -r ".spec.pipelines[${pipeline_index}].inputRefs[]?" 2>/dev/null || echo "")
+                    
+                    local output_refs
+                    output_refs=$(echo "${clf_json}" | jq -r ".spec.pipelines[${pipeline_index}].outputRefs[]?" 2>/dev/null || echo "")
+                    
+                    # Check if this pipeline has lokiStack output
+                    local has_loki_output=false
+                    if [[ -n "${output_refs}" ]]; then
+                        # Check if any output is lokiStack type
+                        local outputs_count
+                        outputs_count=$(echo "${clf_json}" | jq '.spec.outputs | length' 2>/dev/null || echo "0")
+                        
+                        local output_index=0
+                        while [[ ${output_index} -lt ${outputs_count} ]]; do
+                            local output_name
+                            local output_type
+                            output_name=$(echo "${clf_json}" | jq -r ".spec.outputs[${output_index}].name" 2>/dev/null || echo "")
+                            output_type=$(echo "${clf_json}" | jq -r ".spec.outputs[${output_index}].type" 2>/dev/null || echo "")
+                            
+                            if [[ "${output_type}" == "lokiStack" ]] && echo "${output_refs}" | grep -q "${output_name}"; then
+                                has_loki_output=true
+                                log_debug "Found lokiStack output: ${output_name}"
+                                break
+                            fi
+                            
+                            ((output_index++))
+                        done
+                    fi
+                    
+                    # If this pipeline has loki output, check input refs
+                    if [[ "${has_loki_output}" == "true" ]]; then
+                        log_debug "Pipeline ${pipeline_index} has lokiStack output, checking inputRefs: ${input_refs}"
+                        
+                        # Check for each tenant type in inputRefs
+                        if echo "${input_refs}" | grep -q "audit"; then
+                            audit_configured="configured"
+                            log_debug "Audit tenant configured via ClusterLogForwarder"
+                        fi
+                        
+                        if echo "${input_refs}" | grep -q "infrastructure"; then
+                            infrastructure_configured="configured"
+                            log_debug "Infrastructure tenant configured via ClusterLogForwarder"
+                        fi
+                        
+                        if echo "${input_refs}" | grep -q "application"; then
+                            application_configured="configured"
+                            log_debug "Application tenant configured via ClusterLogForwarder"
+                        fi
+                    fi
+                    
+                    ((pipeline_index++))
+                done
+            else
+                log_debug "No pipelines found in ClusterLogForwarder"
+            fi
+        else
+            log_debug "ClusterLogForwarder instance not found or empty"
+        fi
+    else
+        log_debug "Failed to get ClusterLogForwarder or it doesn't exist"
+    fi
+    
+    # Create result JSON
+    local clf_result
+    clf_result=$(cat << EOF
+{
+    "audit_tenant": "${audit_configured}",
+    "infrastructure_tenant": "${infrastructure_configured}",
+    "application_tenant": "${application_configured}",
+    "check_timestamp": "$(get_timestamp)"
+}
+EOF
+    )
+    
+    log_debug "ClusterLogForwarder tenant check completed"
+    echo "${clf_result}"
+}
+
 # Check Loki component pods status by examining running pods
 check_loki_component_pods() {
     log_debug "Checking Loki component pods in openshift-logging namespace..."
@@ -4034,8 +4889,8 @@ check_loki_component_pods() {
                     fi
                 fi
                 
-                # Check for collector component (fluentd, vector, or other log collectors)
-                if echo "${pod_name}" | grep -qiE "(collector|fluentd|vector|logging.*collector|log.*collector)"; then
+                # Check for collector component (any pod that could be a collector)
+                if echo "${pod_name}" | grep -qiE "(collector|fluentd|vector|fluent-bit|filebeat|logstash|rsyslog)"; then
                     if [[ "${pod_phase}" == "Running" ]]; then
                         collector_status="running"
                         log_debug "Collector pod found and running: ${pod_name}"
@@ -4055,6 +4910,73 @@ check_loki_component_pods() {
         return 1
     fi
     
+    # Check for collector DaemonSets if collector not found in pods
+    # In OpenShift logging, collectors run as DaemonSets
+    if [[ "${collector_status}" == "not_found" ]]; then
+        log_debug "Checking for DaemonSets in openshift-logging namespace..."
+        
+        local daemonsets_json=""
+        if daemonsets_json=$(execute_oc_json "get daemonsets -n openshift-logging -o json" "Get DaemonSets in openshift-logging" 1); then
+            local ds_count
+            ds_count=$(echo "${daemonsets_json}" | jq '.items | length' 2>/dev/null || echo "0")
+            
+            if [[ "${ds_count}" -gt 0 ]]; then
+                log_debug "Found ${ds_count} DaemonSets in openshift-logging namespace"
+                
+                # List all DaemonSets for debugging
+                local all_ds_names
+                all_ds_names=$(echo "${daemonsets_json}" | jq -r '.items[].metadata.name' 2>/dev/null | tr '\n' ' ')
+                log_debug "DaemonSets found: ${all_ds_names}"
+                
+                # Check each DaemonSet - any DaemonSet in openshift-logging is likely a collector
+                local ds_index=0
+                while [[ ${ds_index} -lt ${ds_count} ]]; do
+                    local ds_name
+                    local ds_ready
+                    local ds_desired
+                    
+                    ds_name=$(echo "${daemonsets_json}" | jq -r ".items[${ds_index}].metadata.name" 2>/dev/null || echo "unknown")
+                    ds_ready=$(echo "${daemonsets_json}" | jq -r ".items[${ds_index}].status.numberReady // 0" 2>/dev/null || echo "0")
+                    ds_desired=$(echo "${daemonsets_json}" | jq -r ".items[${ds_index}].status.desiredNumberScheduled // 0" 2>/dev/null || echo "0")
+                    
+                    log_debug "Found DaemonSet: ${ds_name} (${ds_ready}/${ds_desired} ready)"
+                    
+                    # Confirm this is a collector by checking if it has running pods
+                    if [[ "${ds_ready}" -gt 0 && "${ds_ready}" == "${ds_desired}" ]]; then
+                        collector_status="running"
+                        log_debug "Collector DaemonSet confirmed running: ${ds_name}"
+                        # Store the collector name for display
+                        echo "${ds_name}" > "${TEMP_DIR}/collector_name.txt"
+                        break
+                    elif [[ "${ds_ready}" -gt 0 ]]; then
+                        collector_status="partially_running"
+                        log_debug "Collector DaemonSet partially running: ${ds_name} (${ds_ready}/${ds_desired})"
+                        # Store the collector name for display
+                        echo "${ds_name}" > "${TEMP_DIR}/collector_name.txt"
+                        break
+                    else
+                        log_debug "DaemonSet found but not ready: ${ds_name}"
+                        collector_status="not_running"
+                        # Store the collector name for display
+                        echo "${ds_name}" > "${TEMP_DIR}/collector_name.txt"
+                    fi
+                    
+                    ((ds_index++))
+                done
+            else
+                log_debug "No DaemonSets found in openshift-logging namespace"
+            fi
+        else
+            log_debug "Failed to retrieve DaemonSets from openshift-logging namespace"
+        fi
+    fi
+    
+    # Get collector name if stored
+    local collector_name=""
+    if [[ -f "${TEMP_DIR}/collector_name.txt" ]]; then
+        collector_name=$(cat "${TEMP_DIR}/collector_name.txt" 2>/dev/null || echo "")
+    fi
+    
     # Create result JSON
     local components_result
     components_result=$(cat << EOF
@@ -4067,7 +4989,8 @@ check_loki_component_pods() {
     "querier": "${querier_status}",
     "query_frontend": "${query_frontend_status}",
     "ruler": "${ruler_status}",
-    "collector": "${collector_status}"
+    "collector": "${collector_status}",
+    "collector_name": "${collector_name}"
 }
 EOF
     )
@@ -4187,6 +5110,7 @@ check_loki_status() {
     loki_status["query_frontend_status"]="unknown"
     loki_status["ruler_status"]="unknown"
     loki_status["collector_status"]="unknown"
+    loki_status["collector_name"]=""
     loki_status["check_timestamp"]="$(get_timestamp)"
     loki_status["details"]=""
     loki_status["errors"]=""
@@ -4280,66 +5204,99 @@ check_loki_status() {
     
     # Step 1.5: Check ClusterLogForwarder configuration for additional Loki tenant info
     log_debug "Checking ClusterLogForwarder configuration for Loki outputs..."
-    local clusterlogforwarder_temp_file
-    clusterlogforwarder_temp_file=$(create_temp_file "clusterlogforwarder" ".yaml")
     
-    if execute_oc_command "get clusterlogforwarders -n openshift-logging -o yaml" "Get ClusterLogForwarder configuration" 1 5 "${clusterlogforwarder_temp_file}"; then
-        log_debug "ClusterLogForwarder configuration saved to: ${clusterlogforwarder_temp_file}"
+    local clusterlogforwarder_json=""
+    if clusterlogforwarder_json=$(execute_oc_json "get clusterlogforwarder -n openshift-logging -o json" "Get ClusterLogForwarder configuration" 1); then
+        log_debug "ClusterLogForwarder configuration retrieved successfully"
         
-        # Check if ClusterLogForwarder with LokiStack output exists
-        if grep -q "kind: ClusterLogForwarder" "${clusterlogforwarder_temp_file}" 2>/dev/null && grep -q "type: lokiStack" "${clusterlogforwarder_temp_file}" 2>/dev/null; then
-            log_debug "ClusterLogForwarder with LokiStack output found"
+        # Check if any ClusterLogForwarder exists
+        local clf_count
+        clf_count=$(echo "${clusterlogforwarder_json}" | jq '.items | length' 2>/dev/null || echo "0")
+        
+        if [[ "${clf_count}" -gt 0 ]]; then
+            log_debug "Found ${clf_count} ClusterLogForwarder(s)"
+            
+            # List all ClusterLogForwarders for debugging
+            local all_clf_names
+            all_clf_names=$(echo "${clusterlogforwarder_json}" | jq -r '.items[].metadata.name' 2>/dev/null | tr '\n' ' ')
+            log_debug "ClusterLogForwarders found: ${all_clf_names}"
             
             # Check what log types are being forwarded to LokiStack
             local clf_has_audit=false
             local clf_has_infrastructure=false
             local clf_has_application=false
             
-            # Look for pipelines that reference LokiStack outputs
-            local in_pipeline=false
-            local current_pipeline_refs=""
-            
-            while IFS= read -r line; do
-                # Check if we're entering a pipeline section
-                if echo "$line" | grep -q "^[[:space:]]*- name:.*pipeline"; then
-                    in_pipeline=true
-                    current_pipeline_refs=""
-                elif echo "$line" | grep -q "^[[:space:]]*- name:" && [[ "$in_pipeline" == true ]]; then
-                    # New pipeline or section, reset
-                    in_pipeline=false
-                    current_pipeline_refs=""
-                elif [[ "$in_pipeline" == true ]]; then
-                    # Collect inputRefs for this pipeline
-                    if echo "$line" | grep -q "inputRefs:"; then
-                        current_pipeline_refs=""
-                    elif echo "$line" | grep -q "^[[:space:]]*- audit"; then
-                        current_pipeline_refs="${current_pipeline_refs} audit"
-                    elif echo "$line" | grep -q "^[[:space:]]*- infrastructure"; then
-                        current_pipeline_refs="${current_pipeline_refs} infrastructure"
-                    elif echo "$line" | grep -q "^[[:space:]]*- application"; then
-                        current_pipeline_refs="${current_pipeline_refs} application"
-                    elif echo "$line" | grep -q "outputRefs:" && echo "$current_pipeline_refs" | grep -q "audit"; then
-                        # Check if this pipeline with audit logs goes to lokistack
-                        local next_lines
-                        next_lines=$(grep -A 5 "outputRefs:" "${clusterlogforwarder_temp_file}" | grep -E "(lokistack|loki-stack)")
-                        if [[ -n "$next_lines" ]]; then
-                            clf_has_audit=true
+            # Check each ClusterLogForwarder
+            local clf_index=0
+            while [[ ${clf_index} -lt ${clf_count} ]]; do
+                local clf_name
+                clf_name=$(echo "${clusterlogforwarder_json}" | jq -r ".items[${clf_index}].metadata.name" 2>/dev/null || echo "unknown")
+                log_debug "Checking ClusterLogForwarder: ${clf_name}"
+                
+                # Check if this CLF has LokiStack outputs
+                local has_lokistack_output
+                has_lokistack_output=$(echo "${clusterlogforwarder_json}" | jq -r ".items[${clf_index}].spec.outputs[]? | select(.type == \"lokiStack\") | .name" 2>/dev/null)
+                
+                # Debug: show all outputs
+                local all_outputs
+                all_outputs=$(echo "${clusterlogforwarder_json}" | jq -r ".items[${clf_index}].spec.outputs[]?.name" 2>/dev/null | tr '\n' ' ')
+                log_debug "All outputs in ${clf_name}: ${all_outputs}"
+                
+                if [[ -n "${has_lokistack_output}" ]]; then
+                    log_debug "Found LokiStack output in ${clf_name}: ${has_lokistack_output}"
+                    
+                    # Check pipelines that reference this LokiStack output
+                    local pipeline_count
+                    pipeline_count=$(echo "${clusterlogforwarder_json}" | jq ".items[${clf_index}].spec.pipelines | length" 2>/dev/null || echo "0")
+                    
+                    local pipeline_index=0
+                    while [[ ${pipeline_index} -lt ${pipeline_count} ]]; do
+                        local pipeline_name
+                        pipeline_name=$(echo "${clusterlogforwarder_json}" | jq -r ".items[${clf_index}].spec.pipelines[${pipeline_index}].name" 2>/dev/null || echo "unknown")
+                        
+                        # Check if this pipeline references the LokiStack output
+                        local references_lokistack
+                        references_lokistack=$(echo "${clusterlogforwarder_json}" | jq -r ".items[${clf_index}].spec.pipelines[${pipeline_index}].outputRefs[]?" 2>/dev/null | grep -i "${has_lokistack_output}" || echo "")
+                        
+                        if [[ -n "${references_lokistack}" ]]; then
+                            log_debug "Pipeline ${pipeline_name} references LokiStack output"
+                            
+                            # Check what input types this pipeline handles
+                            local input_refs
+                            input_refs=$(echo "${clusterlogforwarder_json}" | jq -r ".items[${clf_index}].spec.pipelines[${pipeline_index}].inputRefs[]?" 2>/dev/null)
+                            
+                            log_debug "Pipeline ${pipeline_name} input refs: ${input_refs}"
+                            log_debug "Pipeline ${pipeline_name} output refs: ${references_lokistack}"
+                            
+                            # Check for each tenant type
+                            if echo "${input_refs}" | grep -qi "audit"; then
+                                clf_has_audit=true
+                                log_debug "Found audit logs in pipeline ${pipeline_name}"
+                            fi
+                            
+                            if echo "${input_refs}" | grep -qi "infrastructure"; then
+                                clf_has_infrastructure=true
+                                log_debug "Found infrastructure logs in pipeline ${pipeline_name}"
+                            fi
+                            
+                            if echo "${input_refs}" | grep -qi "application"; then
+                                clf_has_application=true
+                                log_debug "Found application logs in pipeline ${pipeline_name}"
+                            fi
                         fi
-                    elif echo "$line" | grep -q "outputRefs:" && echo "$current_pipeline_refs" | grep -q "infrastructure"; then
-                        local next_lines
-                        next_lines=$(grep -A 5 "outputRefs:" "${clusterlogforwarder_temp_file}" | grep -E "(lokistack|loki-stack)")
-                        if [[ -n "$next_lines" ]]; then
-                            clf_has_infrastructure=true
-                        fi
-                    elif echo "$line" | grep -q "outputRefs:" && echo "$current_pipeline_refs" | grep -q "application"; then
-                        local next_lines
-                        next_lines=$(grep -A 5 "outputRefs:" "${clusterlogforwarder_temp_file}" | grep -E "(lokistack|loki-stack)")
-                        if [[ -n "$next_lines" ]]; then
-                            clf_has_application=true
-                        fi
-                    fi
+                        
+                        ((pipeline_index++))
+                    done
                 fi
-            done < "${clusterlogforwarder_temp_file}"
+                
+                ((clf_index++))
+            done
+            
+            # Summary of ClusterLogForwarder findings
+            log_debug "ClusterLogForwarder tenant detection summary:"
+            log_debug "  Audit: ${clf_has_audit}"
+            log_debug "  Infrastructure: ${clf_has_infrastructure}"
+            log_debug "  Application: ${clf_has_application}"
             
             # Update tenant status based on ClusterLogForwarder findings
             # Only override "not_configured" status, don't downgrade "configured" status
@@ -4359,11 +5316,17 @@ check_loki_status() {
             fi
             
         else
-            log_debug "No ClusterLogForwarder with LokiStack output found"
+            log_debug "No ClusterLogForwarder resources found"
         fi
     else
-        log_debug "Failed to retrieve ClusterLogForwarder configuration or none exists"
+        log_debug "Failed to retrieve ClusterLogForwarder configuration"
     fi
+    
+    # Final tenant status summary
+    log_debug "Final tenant status after all checks:"
+    log_debug "  Audit: ${loki_status["audit_tenant"]}"
+    log_debug "  Infrastructure: ${loki_status["infrastructure_tenant"]}"
+    log_debug "  Application: ${loki_status["application_tenant"]}"
     
     # Step 2: Get pods in openshift-logging namespace and store in temp file
     log_debug "Getting pods from openshift-logging namespace..."
@@ -4466,13 +5429,63 @@ check_loki_status() {
                         fi
                     fi
                     
-                    if echo "${pod_name}" | grep -qiE "(collector|fluentd|vector|logging.*collector)"; then
+                    if echo "${pod_name}" | grep -qiE "(collector|fluentd|vector|fluent-bit|filebeat|logstash|rsyslog)"; then
                         if [[ "${pod_phase}" == "Running" && "${pod_ready}" == "True" ]]; then
                             ((collector_running++))
                         fi
                     fi
                 fi
             done
+        fi
+        
+        # Check for collector DaemonSets if no collector pods found
+        # Collectors in OpenShift logging always run as DaemonSets
+        if [[ ${collector_running} -eq 0 ]]; then
+            log_debug "No collector pods found, checking for DaemonSets in openshift-logging namespace..."
+            
+            local daemonsets_json=""
+            if daemonsets_json=$(execute_oc_json "get daemonsets -n openshift-logging -o json" "Get DaemonSets in openshift-logging" 1); then
+                local ds_count
+                ds_count=$(echo "${daemonsets_json}" | jq '.items | length' 2>/dev/null || echo "0")
+                
+                if [[ "${ds_count}" -gt 0 ]]; then
+                    log_debug "Found ${ds_count} DaemonSets in openshift-logging namespace"
+                    
+                    # List all DaemonSets for debugging and confirmation
+                    local all_ds_names
+                    all_ds_names=$(echo "${daemonsets_json}" | jq -r '.items[].metadata.name' 2>/dev/null | tr '\n' ' ')
+                    log_debug "DaemonSets found: ${all_ds_names}"
+                    
+                    # Count ready pods from all DaemonSets (collectors run as DaemonSets)
+                    local total_ready=0
+                    local ds_index=0
+                    while [[ ${ds_index} -lt ${ds_count} ]]; do
+                        local ds_name
+                        local ds_ready
+                        
+                        ds_name=$(echo "${daemonsets_json}" | jq -r ".items[${ds_index}].metadata.name" 2>/dev/null || echo "unknown")
+                        ds_ready=$(echo "${daemonsets_json}" | jq -r ".items[${ds_index}].status.numberReady // 0" 2>/dev/null || echo "0")
+                        
+                        log_debug "DaemonSet '${ds_name}' has ${ds_ready} ready pods"
+                        total_ready=$((total_ready + ds_ready))
+                        
+                        ((ds_index++))
+                    done
+                    
+                    if [[ ${total_ready} -gt 0 ]]; then
+                        collector_running=${total_ready}
+                        log_debug "Confirmed ${total_ready} collector pods running via DaemonSets"
+                        # Store the first DaemonSet name as collector name
+                        local first_ds_name
+                        first_ds_name=$(echo "${daemonsets_json}" | jq -r '.items[0].metadata.name' 2>/dev/null || echo "unknown")
+                        loki_status["collector_name"]="${first_ds_name}"
+                    fi
+                else
+                    log_debug "No DaemonSets found in openshift-logging namespace"
+                fi
+            else
+                log_debug "Failed to retrieve DaemonSets from openshift-logging namespace"
+            fi
         fi
         
         # Set pod counts
@@ -4680,6 +5693,116 @@ declare -A backup_status=(
     ["details"]=""
     ["errors"]=""
 )
+
+# Cluster connectivity status structure
+declare -A connectivity_status=(
+    ["overall_status"]="${STATUS_UNKNOWN}"
+    ["overall_message"]=""
+    ["connectivity_type"]="unknown"
+    ["imagedigestmirrorset_count"]="0"
+    ["imagecontentsourcepolicy_count"]="0"
+    ["mirror_registries"]=""
+    ["check_timestamp"]=""
+    ["details"]=""
+    ["errors"]=""
+)
+
+# Check cluster connectivity status (airgapped vs connected)
+check_cluster_connectivity() {
+    log_info "Checking cluster connectivity status..."
+    
+    # Initialize connectivity status
+    connectivity_status["overall_status"]="${STATUS_UNKNOWN}"
+    connectivity_status["overall_message"]=""
+    connectivity_status["connectivity_type"]="unknown"
+    connectivity_status["imagedigestmirrorset_count"]="0"
+    connectivity_status["imagecontentsourcepolicy_count"]="0"
+    connectivity_status["mirror_registries"]=""
+    connectivity_status["check_timestamp"]="$(get_timestamp)"
+    connectivity_status["details"]=""
+    
+    local error_messages=()
+    
+    # Check for ImageDigestMirrorSet (IDMS) - newer mirroring method
+    log_debug "Checking for ImageDigestMirrorSet resources..."
+    local idms_json=""
+    if idms_json=$(execute_oc_json "get imagedigestmirrorset -o json" "Get ImageDigestMirrorSet" 1); then
+        local idms_count
+        idms_count=$(echo "${idms_json}" | jq '.items | length' 2>/dev/null || echo "0")
+        connectivity_status["imagedigestmirrorset_count"]="${idms_count}"
+        
+        if [[ "${idms_count}" -gt 0 ]]; then
+            log_debug "Found ${idms_count} ImageDigestMirrorSet resources"
+            
+            # Extract mirror registry information
+            local mirror_registries
+            mirror_registries=$(echo "${idms_json}" | jq -r '.items[].spec.mirrors[]?.source' 2>/dev/null | sort -u | tr '\n' ', ' | sed 's/,$//')
+            connectivity_status["mirror_registries"]="${mirror_registries}"
+            
+            connectivity_status["connectivity_type"]="airgapped"
+            connectivity_status["overall_status"]="${STATUS_HEALTHY}"
+            connectivity_status["overall_message"]="Cluster is airgapped with ${idms_count} ImageDigestMirrorSet(s) configured"
+            
+            log_debug "Mirror registries found: ${mirror_registries}"
+        else
+            log_debug "No ImageDigestMirrorSet resources found"
+        fi
+    else
+        log_debug "Failed to retrieve ImageDigestMirrorSet resources or they don't exist"
+        error_messages+=("Failed to check ImageDigestMirrorSet resources")
+    fi
+    
+    # Check for ImageContentSourcePolicy (ICSP) - legacy mirroring method
+    if [[ "${connectivity_status["connectivity_type"]}" == "unknown" ]]; then
+        log_debug "Checking for ImageContentSourcePolicy resources..."
+        local icsp_json=""
+        if icsp_json=$(execute_oc_json "get imagecontentsourcepolicy -o json" "Get ImageContentSourcePolicy" 1); then
+            local icsp_count
+            icsp_count=$(echo "${icsp_json}" | jq '.items | length' 2>/dev/null || echo "0")
+            connectivity_status["imagecontentsourcepolicy_count"]="${icsp_count}"
+            
+            if [[ "${icsp_count}" -gt 0 ]]; then
+                log_debug "Found ${icsp_count} ImageContentSourcePolicy resources"
+                
+                # Extract mirror registry information from ICSP
+                local icsp_mirrors
+                icsp_mirrors=$(echo "${icsp_json}" | jq -r '.items[].spec.repositoryDigestMirrors[]?.mirrors[]?' 2>/dev/null | sort -u | tr '\n' ', ' | sed 's/,$//')
+                if [[ -n "${icsp_mirrors}" ]]; then
+                    connectivity_status["mirror_registries"]="${icsp_mirrors}"
+                fi
+                
+                connectivity_status["connectivity_type"]="airgapped"
+                connectivity_status["overall_status"]="${STATUS_HEALTHY}"
+                connectivity_status["overall_message"]="Cluster is airgapped with ${icsp_count} ImageContentSourcePolicy(s) configured"
+                
+                log_debug "ICSP mirror registries found: ${icsp_mirrors}"
+            else
+                log_debug "No ImageContentSourcePolicy resources found"
+            fi
+        else
+            log_debug "Failed to retrieve ImageContentSourcePolicy resources or they don't exist"
+            error_messages+=("Failed to check ImageContentSourcePolicy resources")
+        fi
+    fi
+    
+    # If no mirroring resources found, assume connected
+    if [[ "${connectivity_status["connectivity_type"]}" == "unknown" ]]; then
+        connectivity_status["connectivity_type"]="connected"
+        connectivity_status["overall_status"]="${STATUS_HEALTHY}"
+        connectivity_status["overall_message"]="Cluster appears to be connected (no image mirroring configured)"
+        log_debug "No image mirroring resources found - cluster appears to be connected"
+    fi
+    
+    # Add error details if any
+    if [[ ${#error_messages[@]} -gt 0 ]]; then
+        local error_details
+        error_details=$(IFS='; '; echo "${error_messages[*]}")
+        connectivity_status["details"]="Errors: ${error_details}"
+    fi
+    
+    log_debug "Cluster connectivity check completed: ${connectivity_status["connectivity_type"]}"
+    return 0
+}
 
 # Check cluster backup status
 check_backup_status() {
@@ -4911,6 +6034,2417 @@ Check Timestamp: ${backup_status["check_timestamp"]}
 EOF
             if [[ -n "${backup_status["errors"]}" ]]; then
                 echo "Errors: ${backup_status["errors"]}"
+            fi
+            ;;
+    esac
+}
+
+# =============================================================================
+# STORAGE CLASSES MODULE
+# =============================================================================
+
+# Storage classes status structure
+declare -A storage_status=(
+    ["overall_status"]="${STATUS_UNKNOWN}"
+    ["overall_message"]=""
+    ["total_storage_classes"]="0"
+    ["default_storage_class"]="unknown"
+    ["csi_storage_classes"]="0"
+    ["non_csi_storage_classes"]="0"
+    ["backend_storage_types"]=""
+    ["provisioner_types"]=""
+    ["volume_binding_modes"]=""
+    ["reclaim_policies"]=""
+    ["allow_volume_expansion"]="0"
+    ["check_timestamp"]=""
+    ["details"]=""
+    ["errors"]=""
+)
+
+# Identify backend storage type from provisioner
+identify_backend_storage() {
+    local provisioner="$1"
+    
+    log_debug "Identifying backend storage for provisioner: ${provisioner}"
+    
+    case "${provisioner}" in
+        # AWS EBS
+        "ebs.csi.aws.com"|"kubernetes.io/aws-ebs")
+            echo "AWS EBS"
+            ;;
+        # AWS EFS
+        "efs.csi.aws.com")
+            echo "AWS EFS"
+            ;;
+        # AWS FSx
+        "fsx.csi.aws.com")
+            echo "AWS FSx"
+            ;;
+        # Azure Disk
+        "disk.csi.azure.com"|"kubernetes.io/azure-disk")
+            echo "Azure Disk"
+            ;;
+        # Azure File
+        "file.csi.azure.com"|"kubernetes.io/azure-file")
+            echo "Azure File"
+            ;;
+        # GCP Persistent Disk
+        "pd.csi.storage.gke.io"|"kubernetes.io/gce-pd")
+            echo "GCP Persistent Disk"
+            ;;
+        # GCP Filestore
+        "filestore.csi.storage.gke.io")
+            echo "GCP Filestore"
+            ;;
+        # VMware vSphere
+        "csi.vsphere.vmware.com"|"kubernetes.io/vsphere-volume")
+            echo "VMware vSphere"
+            ;;
+        # OpenStack Cinder
+        "cinder.csi.openstack.org"|"kubernetes.io/cinder")
+            echo "OpenStack Cinder"
+            ;;
+        # Red Hat OpenShift Data Foundation (ODF) / Ceph
+        "openshift-storage.rbd.csi.ceph.com"|"rbd.csi.ceph.com")
+            echo "Red Hat ODF (Ceph RBD)"
+            ;;
+        "openshift-storage.cephfs.csi.ceph.com"|"cephfs.csi.ceph.com")
+            echo "Red Hat ODF (CephFS)"
+            ;;
+        # Red Hat OpenShift Container Storage (OCS) - Legacy
+        "ocs-storagecluster-ceph-rbd"|"ocs-storagecluster-cephfs")
+            echo "Red Hat OCS (Legacy)"
+            ;;
+        # NetApp Trident
+        "csi.trident.netapp.io"|"netapp.io/trident")
+            echo "NetApp Trident"
+            ;;
+        # Pure Storage
+        "pure-csi"|"purestorage.com/csi")
+            echo "Pure Storage"
+            ;;
+        # Dell EMC / Dell CSM (Container Storage Modules)
+        "csi-powermax.dellemc.com"|"csi-unity.dellemc.com"|"csi-isilon.dellemc.com"|"csi-vxflexos.dellemc.com"|"csi-powerflex.dellemc.com"|"csi-powerstore.dellemc.com"|"csi-powerscale.dellemc.com")
+            echo "Dell EMC"
+            ;;
+        # Dell CSM (Container Storage Modules) - newer naming
+        "powermax.csi.dellemc.com"|"unity.csi.dellemc.com"|"isilon.csi.dellemc.com"|"vxflexos.csi.dellemc.com"|"powerflex.csi.dellemc.com"|"powerstore.csi.dellemc.com"|"powerscale.csi.dellemc.com")
+            echo "Dell CSM"
+            ;;
+        # Dell CSI drivers with different naming patterns
+        *"dellemc"*|*"dell"*|*"powermax"*|*"unity"*|*"isilon"*|*"powerflex"*|*"powerstore"*|*"powerscale"*)
+            echo "Dell Technologies"
+            ;;
+        # HPE Storage
+        "csi.hpe.com"|"hpe.com/csi"|"primera.csi.hpe.com"|"nimble.csi.hpe.com"|"3par.csi.hpe.com")
+            echo "HPE Storage"
+            ;;
+        # IBM Storage
+        "spectrumscale.csi.ibm.com"|"block.csi.ibm.com"|"ibm.com/csi")
+            echo "IBM Storage"
+            ;;
+        # NetApp
+        "csi.trident.netapp.io"|"netapp.io/trident"|"trident.netapp.io")
+            echo "NetApp Trident"
+            ;;
+        # NFS CSI drivers
+        "nfs.csi.k8s.io"|"csi-nfsplugin"|"kubernetes.io/nfs")
+            echo "NFS Storage"
+            ;;
+        # NFS Subdir External Provisioner and other NFS provisioners
+        *"nfs-subdir-external-provisioner"*|*"nfs.csi"*|*"/nfs"*|*"nfs-"*|*"-nfs"*)
+            echo "NFS"
+            ;;
+        # Portworx
+        "pxd.portworx.com"|"kubernetes.io/portworx-volume"|"portworx.com/csi")
+            echo "Portworx"
+            ;;
+        # Local Storage
+        "kubernetes.io/no-provisioner"|"local.storage.openshift.io/local")
+            echo "Local Storage"
+            ;;
+        # Local Storage Operator
+        "local-storage.openshift.io/local")
+            echo "OpenShift Local Storage"
+            ;;
+        # NFS (standard)
+        "nfs.csi.k8s.io"|"kubernetes.io/nfs")
+            echo "NFS"
+            ;;
+        # iSCSI
+        "iscsi.csi.k8s.io"|"kubernetes.io/iscsi")
+            echo "iSCSI"
+            ;;
+        # Longhorn
+        "driver.longhorn.io")
+            echo "Longhorn"
+            ;;
+        # Rook Ceph
+        "rook-ceph.rbd.csi.ceph.com"|"rook-ceph.cephfs.csi.ceph.com")
+            echo "Rook Ceph"
+            ;;
+        # MinIO
+        "minio.csi.k8s.io")
+            echo "MinIO"
+            ;;
+        # Ceph RADOS Gateway (RGW) Object Storage
+        "openshift-storage.ceph.rook.io/bucket"|"ceph.rook.io/bucket")
+            echo "Red Hat ODF (Ceph RGW)"
+            ;;
+        # NooBaa S3 Compatible Object Storage
+        "openshift-storage.noobaa.io/obc"|"noobaa.io/obc")
+            echo "Red Hat ODF (NooBaa S3)"
+            ;;
+        # Longhorn
+        "driver.longhorn.io")
+            echo "Longhorn"
+            ;;
+        # Rook Ceph (non-ODF)
+        "rook-ceph.cephfs.csi.ceph.com"|"rook-ceph.rbd.csi.ceph.com")
+            echo "Rook Ceph"
+            ;;
+        # MinIO
+        "minio.csi.k8s.io")
+            echo "MinIO"
+            ;;
+        # Ceph CSI (standalone)
+        "cephfs.csi.ceph.com"|"rbd.csi.ceph.com")
+            echo "Ceph CSI"
+            ;;
+        # Generic CSI with better parsing
+        *.csi.*)
+            local vendor=$(echo "${provisioner}" | cut -d'.' -f1)
+            local product=$(echo "${provisioner}" | cut -d'.' -f2 2>/dev/null || echo "")
+            if [[ -n "${product}" && "${product}" != "csi" ]]; then
+                echo "CSI (${vendor} ${product})"
+            else
+                echo "CSI (${vendor})"
+            fi
+            ;;
+        # CSI drivers with different patterns
+        *csi*)
+            local vendor=$(echo "${provisioner}" | sed 's/.*\.\([^.]*\)\.csi\..*/\1/' | sed 's/csi-//' | sed 's/-csi//')
+            if [[ "${vendor}" != "${provisioner}" ]]; then
+                echo "CSI (${vendor})"
+            else
+                echo "CSI Driver"
+            fi
+            ;;
+        # Unknown/Other
+        *)
+            echo "Unknown (${provisioner})"
+            ;;
+    esac
+}
+
+# Get storage class performance characteristics
+get_storage_performance_info() {
+    local provisioner="$1"
+    local parameters="$2"
+    
+    log_debug "Getting performance info for provisioner: ${provisioner}"
+    
+    local performance_tier="Unknown"
+    local iops_info=""
+    local throughput_info=""
+    
+    case "${provisioner}" in
+        "ebs.csi.aws.com"|"kubernetes.io/aws-ebs")
+            # Parse AWS EBS type from parameters
+            local ebs_type
+            ebs_type=$(echo "${parameters}" | jq -r '.type // "gp3"' 2>/dev/null || echo "gp3")
+            
+            case "${ebs_type}" in
+                "gp3")
+                    performance_tier="General Purpose SSD (gp3)"
+                    iops_info="3,000-16,000 IOPS"
+                    throughput_info="125-1,000 MB/s"
+                    ;;
+                "gp2")
+                    performance_tier="General Purpose SSD (gp2)"
+                    iops_info="100-16,000 IOPS"
+                    throughput_info="128-250 MB/s"
+                    ;;
+                "io1"|"io2")
+                    performance_tier="Provisioned IOPS SSD"
+                    iops_info="100-64,000 IOPS"
+                    throughput_info="Up to 1,000 MB/s"
+                    ;;
+                "st1")
+                    performance_tier="Throughput Optimized HDD"
+                    iops_info="Up to 500 IOPS"
+                    throughput_info="Up to 500 MB/s"
+                    ;;
+                "sc1")
+                    performance_tier="Cold HDD"
+                    iops_info="Up to 250 IOPS"
+                    throughput_info="Up to 250 MB/s"
+                    ;;
+                *)
+                    performance_tier="AWS EBS (${ebs_type})"
+                    ;;
+            esac
+            ;;
+        "disk.csi.azure.com"|"kubernetes.io/azure-disk")
+            # Parse Azure disk type
+            local azure_type
+            azure_type=$(echo "${parameters}" | jq -r '.skuName // "Premium_LRS"' 2>/dev/null || echo "Premium_LRS")
+            
+            case "${azure_type}" in
+                "Premium_LRS")
+                    performance_tier="Premium SSD"
+                    iops_info="120-20,000 IOPS"
+                    throughput_info="25-900 MB/s"
+                    ;;
+                "StandardSSD_LRS")
+                    performance_tier="Standard SSD"
+                    iops_info="120-6,000 IOPS"
+                    throughput_info="25-750 MB/s"
+                    ;;
+                "Standard_LRS")
+                    performance_tier="Standard HDD"
+                    iops_info="Up to 500 IOPS"
+                    throughput_info="Up to 60 MB/s"
+                    ;;
+                "UltraSSD_LRS")
+                    performance_tier="Ultra SSD"
+                    iops_info="300-160,000 IOPS"
+                    throughput_info="300-2,000 MB/s"
+                    ;;
+                *)
+                    performance_tier="Azure Disk (${azure_type})"
+                    ;;
+            esac
+            ;;
+        "pd.csi.storage.gke.io"|"kubernetes.io/gce-pd")
+            # Parse GCP disk type
+            local gcp_type
+            gcp_type=$(echo "${parameters}" | jq -r '.type // "pd-standard"' 2>/dev/null || echo "pd-standard")
+            
+            case "${gcp_type}" in
+                "pd-ssd")
+                    performance_tier="SSD Persistent Disk"
+                    iops_info="Up to 30,000 IOPS"
+                    throughput_info="Up to 1,200 MB/s"
+                    ;;
+                "pd-standard")
+                    performance_tier="Standard Persistent Disk"
+                    iops_info="Up to 7,500 IOPS"
+                    throughput_info="Up to 1,200 MB/s"
+                    ;;
+                "pd-balanced")
+                    performance_tier="Balanced Persistent Disk"
+                    iops_info="Up to 15,000 IOPS"
+                    throughput_info="Up to 1,200 MB/s"
+                    ;;
+                "pd-extreme")
+                    performance_tier="Extreme Persistent Disk"
+                    iops_info="Up to 100,000 IOPS"
+                    throughput_info="Up to 2,400 MB/s"
+                    ;;
+                *)
+                    performance_tier="GCP Disk (${gcp_type})"
+                    ;;
+            esac
+            ;;
+        *"ceph"*)
+            performance_tier="Ceph Storage"
+            iops_info="Depends on cluster configuration"
+            throughput_info="Depends on network and disks"
+            ;;
+        *"nfs"*|*"NFS"*)
+            performance_tier="NFS Storage"
+            iops_info="Depends on NFS server and network"
+            throughput_info="Network-dependent"
+            ;;
+        *"local"*)
+            performance_tier="Local Storage"
+            iops_info="Depends on local disk type"
+            throughput_info="Direct disk access"
+            ;;
+        *)
+            performance_tier="Unknown"
+            ;;
+    esac
+    
+    # Create performance info JSON
+    local performance_result
+    performance_result=$(cat << EOF
+{
+    "performance_tier": "${performance_tier}",
+    "iops_info": "${iops_info}",
+    "throughput_info": "${throughput_info}"
+}
+EOF
+    )
+    
+    echo "${performance_result}"
+}
+
+# Check storage classes and CSI drivers
+check_storage_classes() {
+    log_info "Checking storage classes and CSI drivers..."
+    
+    # Reset storage status
+    storage_status["overall_status"]="${STATUS_UNKNOWN}"
+    storage_status["overall_message"]=""
+    storage_status["total_storage_classes"]="0"
+    storage_status["default_storage_class"]="unknown"
+    storage_status["csi_storage_classes"]="0"
+    storage_status["non_csi_storage_classes"]="0"
+    storage_status["backend_storage_types"]=""
+    storage_status["provisioner_types"]=""
+    storage_status["volume_binding_modes"]=""
+    storage_status["reclaim_policies"]=""
+    storage_status["allow_volume_expansion"]="0"
+    storage_status["check_timestamp"]="$(get_timestamp)"
+    storage_status["details"]=""
+    storage_status["errors"]=""
+    
+    local error_messages=()
+    local all_checks_successful=true
+    
+    # Get storage classes
+    local storage_classes_json=""
+    if ! storage_classes_json=$(execute_oc_json "get storageclasses -o json" "Get storage classes"); then
+        log_error "Failed to retrieve storage classes"
+        storage_status["overall_status"]="${STATUS_CRITICAL}"
+        storage_status["overall_message"]="Failed to retrieve storage classes"
+        storage_status["errors"]="Unable to access storage classes"
+        return 1
+    fi
+    
+    # Validate storage classes JSON
+    if ! validate_json "${storage_classes_json}" "storage classes data"; then
+        log_error "Invalid JSON response from storage classes query"
+        storage_status["overall_status"]="${STATUS_CRITICAL}"
+        storage_status["overall_message"]="Invalid response from cluster API"
+        storage_status["errors"]="Invalid JSON response from storage classes query"
+        return 1
+    fi
+    
+    # Count total storage classes
+    local total_storage_classes
+    total_storage_classes=$(count_json_array "${storage_classes_json}" ".items" "storage classes")
+    storage_status["total_storage_classes"]="${total_storage_classes}"
+    
+    if [[ "${total_storage_classes}" -eq 0 ]]; then
+        log_warn "No storage classes found in cluster"
+        storage_status["overall_status"]="${STATUS_WARNING}"
+        storage_status["overall_message"]="No storage classes found in cluster"
+        return 0
+    fi
+    
+    log_info "Found ${total_storage_classes} storage classes to analyze"
+    
+    # Initialize counters and arrays
+    local csi_count=0
+    local non_csi_count=0
+    local expansion_enabled_count=0
+    local default_storage_class="none"
+    local storage_class_details=()
+    local backend_types=()
+    local provisioner_types=()
+    local binding_modes=()
+    local reclaim_policies=()
+    
+    # Process each storage class
+    local sc_index=0
+    while [[ ${sc_index} -lt ${total_storage_classes} ]]; do
+        # Extract storage class information
+        local sc_name
+        local sc_provisioner
+        local sc_reclaim_policy
+        local sc_volume_binding_mode
+        local sc_allow_volume_expansion
+        local sc_is_default
+        local sc_parameters
+        
+        sc_name=$(parse_json_field "${storage_classes_json}" ".items[${sc_index}].metadata.name" "" "storage class name")
+        
+        if [[ -z "${sc_name}" ]]; then
+            log_warn "Skipping storage class with missing name at index ${sc_index}"
+            ((sc_index++))
+            continue
+        fi
+        
+        log_debug "Processing storage class ${sc_index}/${total_storage_classes}: ${sc_name}"
+        
+        # Extract storage class properties
+        sc_provisioner=$(parse_json_field "${storage_classes_json}" ".items[${sc_index}].provisioner" "unknown" "provisioner")
+        sc_reclaim_policy=$(parse_json_field "${storage_classes_json}" ".items[${sc_index}].reclaimPolicy" "Delete" "reclaim policy")
+        sc_volume_binding_mode=$(parse_json_field "${storage_classes_json}" ".items[${sc_index}].volumeBindingMode" "Immediate" "volume binding mode")
+        sc_allow_volume_expansion=$(parse_json_field "${storage_classes_json}" ".items[${sc_index}].allowVolumeExpansion" "false" "allow volume expansion")
+        sc_parameters=$(parse_json_field "${storage_classes_json}" ".items[${sc_index}].parameters" "{}" "parameters")
+        
+        # Check if this is the default storage class
+        local annotations_json
+        annotations_json=$(parse_json_field "${storage_classes_json}" ".items[${sc_index}].metadata.annotations" "{}" "annotations")
+        
+        sc_is_default="false"
+        if echo "${annotations_json}" | grep -q "storageclass.kubernetes.io/is-default-class.*true"; then
+            sc_is_default="true"
+            default_storage_class="${sc_name}"
+        fi
+        
+        # Determine if it's a CSI driver
+        local is_csi="false"
+        if [[ "${sc_provisioner}" == *.csi.* ]] || [[ "${sc_provisioner}" == *csi* ]]; then
+            is_csi="true"
+            ((csi_count++))
+        else
+            ((non_csi_count++))
+        fi
+        
+        # Count volume expansion capability
+        if [[ "${sc_allow_volume_expansion}" == "true" ]]; then
+            ((expansion_enabled_count++))
+        fi
+        
+        # Identify backend storage type
+        local backend_storage
+        backend_storage=$(identify_backend_storage "${sc_provisioner}")
+        
+        # Get performance information
+        local performance_info
+        performance_info=$(get_storage_performance_info "${sc_provisioner}" "${sc_parameters}")
+        
+        local performance_tier
+        local iops_info
+        local throughput_info
+        performance_tier=$(parse_json_field "${performance_info}" ".performance_tier" "Unknown" "performance tier")
+        iops_info=$(parse_json_field "${performance_info}" ".iops_info" "" "IOPS info")
+        throughput_info=$(parse_json_field "${performance_info}" ".throughput_info" "" "throughput info")
+        
+        # Add to arrays for summary
+        backend_types+=("${backend_storage}")
+        provisioner_types+=("${sc_provisioner}")
+        binding_modes+=("${sc_volume_binding_mode}")
+        reclaim_policies+=("${sc_reclaim_policy}")
+        
+        # Create storage class detail JSON
+        local sc_detail
+        sc_detail=$(cat << EOF
+{
+    "name": "${sc_name}",
+    "provisioner": "${sc_provisioner}",
+    "backend_storage": "${backend_storage}",
+    "reclaim_policy": "${sc_reclaim_policy}",
+    "volume_binding_mode": "${sc_volume_binding_mode}",
+    "allow_volume_expansion": ${sc_allow_volume_expansion},
+    "is_default": ${sc_is_default},
+    "is_csi": ${is_csi},
+    "performance_tier": "${performance_tier}",
+    "iops_info": "${iops_info}",
+    "throughput_info": "${throughput_info}",
+    "parameters": ${sc_parameters},
+    "check_timestamp": "$(get_timestamp)"
+}
+EOF
+        )
+        
+        storage_class_details+=("${sc_detail}")
+        
+        log_debug "Storage class ${sc_name}: provisioner=${sc_provisioner}, backend=${backend_storage}, CSI=${is_csi}"
+        ((sc_index++))
+    done
+    
+    # Update status counters
+    storage_status["csi_storage_classes"]="${csi_count}"
+    storage_status["non_csi_storage_classes"]="${non_csi_count}"
+    storage_status["default_storage_class"]="${default_storage_class}"
+    storage_status["allow_volume_expansion"]="${expansion_enabled_count}"
+    
+    # Create unique lists for summary
+    local unique_backends
+    unique_backends=$(printf '%s\n' "${backend_types[@]}" | sort -u | tr '\n' ',' | sed 's/,$//')
+    storage_status["backend_storage_types"]="${unique_backends}"
+    
+    local unique_provisioners
+    unique_provisioners=$(printf '%s\n' "${provisioner_types[@]}" | sort -u | tr '\n' ',' | sed 's/,$//')
+    storage_status["provisioner_types"]="${unique_provisioners}"
+    
+    local unique_binding_modes
+    unique_binding_modes=$(printf '%s\n' "${binding_modes[@]}" | sort -u | tr '\n' ',' | sed 's/,$//')
+    storage_status["volume_binding_modes"]="${unique_binding_modes}"
+    
+    local unique_reclaim_policies
+    unique_reclaim_policies=$(printf '%s\n' "${reclaim_policies[@]}" | sort -u | tr '\n' ',' | sed 's/,$//')
+    storage_status["reclaim_policies"]="${unique_reclaim_policies}"
+    
+    # Create details JSON array
+    local details_json="["
+    for i in "${!storage_class_details[@]}"; do
+        if [[ ${i} -gt 0 ]]; then
+            details_json+=","
+        fi
+        details_json+="${storage_class_details[${i}]}"
+    done
+    details_json+="]"
+    storage_status["details"]="${details_json}"
+    
+    # Combine error messages
+    if [[ ${#error_messages[@]} -gt 0 ]]; then
+        storage_status["errors"]=$(IFS="; "; echo "${error_messages[*]}")
+    fi
+    
+    # Determine overall status
+    local overall_status="${STATUS_UNKNOWN}"
+    local overall_message=""
+    
+    if [[ "${total_storage_classes}" -eq 0 ]]; then
+        overall_status="${STATUS_CRITICAL}"
+        overall_message="No storage classes available - persistent volumes cannot be provisioned"
+    elif [[ "${default_storage_class}" == "none" ]]; then
+        overall_status="${STATUS_WARNING}"
+        overall_message="${total_storage_classes} storage class(es) available but no default storage class configured"
+    elif [[ "${csi_count}" -eq 0 ]]; then
+        overall_status="${STATUS_WARNING}"
+        overall_message="${total_storage_classes} storage class(es) available but no CSI drivers detected"
+    elif [[ "${csi_count}" -gt 0 && "${default_storage_class}" != "none" ]]; then
+        overall_status="${STATUS_HEALTHY}"
+        overall_message="${total_storage_classes} storage class(es) available with ${csi_count} CSI driver(s) and default class configured"
+    else
+        overall_status="${STATUS_WARNING}"
+        overall_message="Storage classes available but configuration may need review"
+    fi
+    
+    # Update overall status
+    storage_status["overall_status"]="${overall_status}"
+    storage_status["overall_message"]="${overall_message}"
+    
+    # Log summary
+    log_info "Storage classes check completed:"
+    log_info "  Total storage classes: ${total_storage_classes}"
+    log_info "  CSI storage classes: ${csi_count}"
+    log_info "  Non-CSI storage classes: ${non_csi_count}"
+    log_info "  Default storage class: ${default_storage_class}"
+    log_info "  Volume expansion enabled: ${expansion_enabled_count}"
+    log_info "  Backend storage types: ${unique_backends}"
+    log_info "  Overall status: ${overall_status}"
+    
+    case "${overall_status}" in
+        "${STATUS_HEALTHY}")
+            log_success "${overall_message}"
+            ;;
+        "${STATUS_WARNING}")
+            log_warn "${overall_message}"
+            ;;
+        "${STATUS_CRITICAL}")
+            log_error "${overall_message}"
+            ;;
+        *)
+            log_warn "${overall_message}"
+            ;;
+    esac
+    
+    return 0
+}
+
+# Get storage classes status summary
+get_storage_status_summary() {
+    local format="${1:-text}"
+    
+    case "${format}" in
+        "json")
+            cat << EOF
+{
+    "overall_status": "${storage_status["overall_status"]}",
+    "overall_message": "${storage_status["overall_message"]}",
+    "total_storage_classes": ${storage_status["total_storage_classes"]},
+    "default_storage_class": "${storage_status["default_storage_class"]}",
+    "csi_storage_classes": ${storage_status["csi_storage_classes"]},
+    "non_csi_storage_classes": ${storage_status["non_csi_storage_classes"]},
+    "backend_storage_types": "${storage_status["backend_storage_types"]}",
+    "provisioner_types": "${storage_status["provisioner_types"]}",
+    "volume_binding_modes": "${storage_status["volume_binding_modes"]}",
+    "reclaim_policies": "${storage_status["reclaim_policies"]}",
+    "allow_volume_expansion": ${storage_status["allow_volume_expansion"]},
+    "check_timestamp": "${storage_status["check_timestamp"]}",
+    "details": ${storage_status["details"]:-"[]"},
+    "errors": "${storage_status["errors"]}"
+}
+EOF
+            ;;
+        "text"|*)
+            cat << EOF
+Storage Classes Status: ${storage_status["overall_status"]}
+Message: ${storage_status["overall_message"]}
+Total Storage Classes: ${storage_status["total_storage_classes"]}
+Default Storage Class: ${storage_status["default_storage_class"]}
+CSI Storage Classes: ${storage_status["csi_storage_classes"]}
+Non-CSI Storage Classes: ${storage_status["non_csi_storage_classes"]}
+Backend Storage Types: ${storage_status["backend_storage_types"]}
+Volume Expansion Enabled: ${storage_status["allow_volume_expansion"]}
+Check Timestamp: ${storage_status["check_timestamp"]}
+EOF
+            if [[ -n "${storage_status["errors"]}" ]]; then
+                echo "Errors: ${storage_status["errors"]}"
+            fi
+            ;;
+    esac
+}
+
+# =============================================================================
+# ODF (OPENSHIFT DATA FOUNDATION) STATUS MODULE
+# =============================================================================
+
+# ODF status structure
+declare -A odf_status=(
+    ["overall_status"]="${STATUS_UNKNOWN}"
+    ["overall_message"]=""
+    ["odf_installed"]="unknown"
+    ["odf_version"]="unknown"
+    ["deployment_mode"]="unknown"
+    ["storage_cluster_status"]="unknown"
+    ["storage_cluster_name"]="unknown"
+    ["ceph_cluster_health"]="unknown"
+    ["noobaa_status"]="unknown"
+    ["mcg_status"]="unknown"
+    ["odf_operator_status"]="unknown"
+    ["ocs_operator_status"]="unknown"
+    ["storage_nodes_count"]="0"
+    ["storage_capacity_total"]="unknown"
+    ["storage_capacity_used"]="unknown"
+    ["pv_count"]="0"
+    ["pvc_count"]="0"
+    ["check_timestamp"]=""
+    ["details"]=""
+    ["errors"]=""
+)
+
+# Check ODF operator installation
+check_odf_operator() {
+    log_debug "Checking ODF operator installation..."
+    
+    local odf_operator_found="false"
+    local ocs_operator_found="false"
+    local odf_version="unknown"
+    local operator_errors=""
+    
+    # Check for ODF operator (newer)
+    local odf_csv=""
+    if odf_csv=$(execute_oc_json "get csv -A -o json" "Get cluster service versions for ODF" 1 2>/dev/null); then
+        # Look for ODF operator
+        local odf_csv_info
+        odf_csv_info=$(echo "${odf_csv}" | jq -r '.items[] | select(.metadata.name | contains("odf-operator")) | {name: .metadata.name, namespace: .metadata.namespace, phase: .status.phase, version: .spec.version}' 2>/dev/null)
+        
+        if [[ -n "${odf_csv_info}" && "${odf_csv_info}" != "null" ]]; then
+            odf_operator_found="true"
+            odf_version=$(echo "${odf_csv_info}" | jq -r '.version' 2>/dev/null || echo "unknown")
+            log_debug "Found ODF operator version: ${odf_version}"
+        fi
+        
+        # Check for legacy OCS operator
+        local ocs_csv_info
+        ocs_csv_info=$(echo "${odf_csv}" | jq -r '.items[] | select(.metadata.name | contains("ocs-operator")) | {name: .metadata.name, namespace: .metadata.namespace, phase: .status.phase, version: .spec.version}' 2>/dev/null)
+        
+        if [[ -n "${ocs_csv_info}" && "${ocs_csv_info}" != "null" ]]; then
+            ocs_operator_found="true"
+            if [[ "${odf_version}" == "unknown" ]]; then
+                odf_version=$(echo "${ocs_csv_info}" | jq -r '.version' 2>/dev/null || echo "unknown")
+            fi
+            log_debug "Found OCS operator version: ${odf_version}"
+        fi
+    else
+        operator_errors="Failed to retrieve cluster service versions"
+    fi
+    
+    # Create operator result
+    local operator_result
+    operator_result=$(cat << EOF
+{
+    "odf_operator_found": "${odf_operator_found}",
+    "ocs_operator_found": "${ocs_operator_found}",
+    "odf_version": "${odf_version}",
+    "operator_errors": "${operator_errors}",
+    "check_timestamp": "$(get_timestamp)"
+}
+EOF
+    )
+    
+    echo "${operator_result}"
+}
+
+# Check storage cluster configuration
+check_storage_cluster() {
+    log_debug "Checking ODF storage cluster configuration..."
+    
+    local storage_cluster_found="false"
+    local storage_cluster_name="unknown"
+    local storage_cluster_status="unknown"
+    local deployment_mode="unknown"
+    local storage_nodes_count="0"
+    local cluster_errors=""
+    
+    # Check for StorageCluster CRD
+    local storage_clusters=""
+    if storage_clusters=$(execute_oc_json "get storagecluster -A -o json" "Get storage clusters" 1 2>/dev/null); then
+        local cluster_count
+        cluster_count=$(echo "${storage_clusters}" | jq '.items | length' 2>/dev/null || echo "0")
+        
+        if [[ "${cluster_count}" -gt 0 ]]; then
+            storage_cluster_found="true"
+            
+            # Get the first (usually only) storage cluster
+            storage_cluster_name=$(echo "${storage_clusters}" | jq -r '.items[0].metadata.name' 2>/dev/null || echo "unknown")
+            storage_cluster_status=$(echo "${storage_clusters}" | jq -r '.items[0].status.phase' 2>/dev/null || echo "unknown")
+            
+            # Determine deployment mode using multiple indicators
+            local external_storage
+            local storage_device_sets
+            local external_ceph_clusters
+            
+            # Check 1: spec.externalStorage field (primary indicator)
+            external_storage=$(echo "${storage_clusters}" | jq -r '.items[0].spec.externalStorage // false' 2>/dev/null || echo "false")
+            
+            # Check 2: Look for storage device sets (internal mode indicator)
+            storage_device_sets=$(echo "${storage_clusters}" | jq -r '.items[0].spec.storageDeviceSets // []' 2>/dev/null || echo "[]")
+            
+            # Check 3: Look for external Ceph cluster configuration
+            external_ceph_clusters=$(echo "${storage_clusters}" | jq -r '.items[0].spec.externalStorage.enable // false' 2>/dev/null || echo "false")
+            
+            # Check 4: Look for external mode in status
+            local external_mode_status
+            external_mode_status=$(echo "${storage_clusters}" | jq -r '.items[0].status.externalStorage // false' 2>/dev/null || echo "false")
+            
+            # Determine deployment mode based on multiple indicators
+            if [[ "${external_storage}" == "true" ]] || [[ "${external_ceph_clusters}" == "true" ]] || [[ "${external_mode_status}" == "true" ]]; then
+                deployment_mode="external"
+                log_debug "Detected external mode: externalStorage=${external_storage}, externalCeph=${external_ceph_clusters}, statusExternal=${external_mode_status}"
+            elif [[ "${storage_device_sets}" == "[]" || "${storage_device_sets}" == "null" ]]; then
+                # No storage device sets might indicate external mode
+                # Check for external Ceph cluster resources
+                local ceph_clusters=""
+                if ceph_clusters=$(execute_oc_json "get cephcluster -A -o json" "Get Ceph clusters for mode detection" 1 2>/dev/null); then
+                    local external_ceph_count
+                    external_ceph_count=$(echo "${ceph_clusters}" | jq '[.items[] | select(.spec.external.enable == true)] | length' 2>/dev/null || echo "0")
+                    
+                    if [[ "${external_ceph_count}" -gt 0 ]]; then
+                        deployment_mode="external"
+                        log_debug "Detected external mode via external Ceph clusters: ${external_ceph_count}"
+                    else
+                        deployment_mode="internal"
+                        log_debug "Detected internal mode: no external Ceph clusters found"
+                    fi
+                else
+                    deployment_mode="internal"
+                    log_debug "Defaulting to internal mode: cannot determine external indicators"
+                fi
+            else
+                deployment_mode="internal"
+                log_debug "Detected internal mode: storage device sets present"
+            fi
+            
+            # Count storage nodes based on deployment mode
+            if [[ "${deployment_mode}" == "external" ]]; then
+                # For external mode, try to count external Ceph nodes or use a different approach
+                local external_nodes=""
+                if external_nodes=$(execute_oc_json "get cephcluster -A -o json" "Get external Ceph nodes" 1 2>/dev/null); then
+                    # Try to get node count from external Ceph cluster status
+                    storage_nodes_count=$(echo "${external_nodes}" | jq -r '.items[0].status.ceph.capacity.totalNodes // 0' 2>/dev/null || echo "0")
+                    
+                    # If that fails, try to count from external cluster configuration
+                    if [[ "${storage_nodes_count}" == "0" ]]; then
+                        storage_nodes_count=$(echo "${external_nodes}" | jq -r '.items[0].spec.external.enable // false | if . then "external" else "0" end' 2>/dev/null || echo "0")
+                        if [[ "${storage_nodes_count}" == "external" ]]; then
+                            storage_nodes_count="external"
+                        fi
+                    fi
+                fi
+                
+                # If still no count, mark as external
+                if [[ "${storage_nodes_count}" == "0" ]]; then
+                    storage_nodes_count="external"
+                fi
+            else
+                # For internal mode, count storage device sets
+                if [[ "${storage_device_sets}" != "[]" && "${storage_device_sets}" != "null" ]]; then
+                    # Count replicas across all device sets
+                    storage_nodes_count=$(echo "${storage_device_sets}" | jq '[.[].count] | add' 2>/dev/null || echo "0")
+                fi
+            fi
+            
+            log_debug "Found storage cluster: ${storage_cluster_name}, mode: ${deployment_mode}, nodes: ${storage_nodes_count}"
+        else
+            cluster_errors="No storage clusters found"
+        fi
+    else
+        cluster_errors="Failed to retrieve storage clusters or StorageCluster CRD not available"
+    fi
+    
+    # Create cluster result
+    local cluster_result
+    cluster_result=$(cat << EOF
+{
+    "storage_cluster_found": "${storage_cluster_found}",
+    "storage_cluster_name": "${storage_cluster_name}",
+    "storage_cluster_status": "${storage_cluster_status}",
+    "deployment_mode": "${deployment_mode}",
+    "storage_nodes_count": "${storage_nodes_count}",
+    "cluster_errors": "${cluster_errors}",
+    "check_timestamp": "$(get_timestamp)"
+}
+EOF
+    )
+    
+    echo "${cluster_result}"
+}
+
+# Check Ceph cluster health
+check_ceph_cluster_health() {
+    log_debug "Checking Ceph cluster health..."
+    
+    local ceph_health="unknown"
+    local ceph_status="unknown"
+    local health_errors=""
+    
+    # Check CephCluster CRD
+    local ceph_clusters=""
+    if ceph_clusters=$(execute_oc_json "get cephcluster -A -o json" "Get Ceph clusters" 1 2>/dev/null); then
+        local cluster_count
+        cluster_count=$(echo "${ceph_clusters}" | jq '.items | length' 2>/dev/null || echo "0")
+        
+        if [[ "${cluster_count}" -gt 0 ]]; then
+            # Get health from the first Ceph cluster
+            ceph_health=$(echo "${ceph_clusters}" | jq -r '.items[0].status.ceph.health' 2>/dev/null || echo "unknown")
+            ceph_status=$(echo "${ceph_clusters}" | jq -r '.items[0].status.phase' 2>/dev/null || echo "unknown")
+            
+            log_debug "Ceph cluster health: ${ceph_health}, status: ${ceph_status}"
+        else
+            health_errors="No Ceph clusters found"
+        fi
+    else
+        health_errors="Failed to retrieve Ceph clusters or CephCluster CRD not available"
+    fi
+    
+    # Create health result
+    local health_result
+    health_result=$(cat << EOF
+{
+    "ceph_health": "${ceph_health}",
+    "ceph_status": "${ceph_status}",
+    "health_errors": "${health_errors}",
+    "check_timestamp": "$(get_timestamp)"
+}
+EOF
+    )
+    
+    echo "${health_result}"
+}
+
+# Check NooBaa and MCG status with comprehensive analysis
+check_noobaa_mcg_status() {
+    log_debug "Checking NooBaa and MCG status..."
+    
+    local noobaa_status="unknown"
+    local mcg_status="unknown"
+    local noobaa_errors=""
+    local s3_endpoint="unknown"
+    local bucket_claims_count="0"
+    local object_bucket_claims_count="0"
+    local mcg_version="unknown"
+    local noobaa_accounts_count="0"
+    
+    # Check NooBaa system
+    local noobaa_systems=""
+    if noobaa_systems=$(execute_oc_json "get noobaa -A -o json" "Get NooBaa systems" 1 2>/dev/null); then
+        local noobaa_count
+        noobaa_count=$(echo "${noobaa_systems}" | jq '.items | length' 2>/dev/null || echo "0")
+        
+        if [[ "${noobaa_count}" -gt 0 ]]; then
+            noobaa_status=$(echo "${noobaa_systems}" | jq -r '.items[0].status.phase' 2>/dev/null || echo "unknown")
+            
+            # Get S3 endpoint information
+            s3_endpoint=$(echo "${noobaa_systems}" | jq -r '.items[0].status.services.serviceS3.externalDNS[0]' 2>/dev/null || echo "unknown")
+            if [[ "${s3_endpoint}" == "null" || -z "${s3_endpoint}" ]]; then
+                s3_endpoint=$(echo "${noobaa_systems}" | jq -r '.items[0].status.services.serviceS3.internalDNS[0]' 2>/dev/null || echo "unknown")
+            fi
+            
+            # Get NooBaa version
+            mcg_version=$(echo "${noobaa_systems}" | jq -r '.items[0].status.actualImage' 2>/dev/null | sed 's/.*://' || echo "unknown")
+            
+            log_debug "NooBaa status: ${noobaa_status}, S3 endpoint: ${s3_endpoint}"
+        else
+            noobaa_status="not_found"
+        fi
+    else
+        noobaa_errors="Failed to retrieve NooBaa systems"
+    fi
+    
+    # Check NooBaa accounts
+    local noobaa_accounts=""
+    if noobaa_accounts=$(execute_oc_json "get noobaaaccount -A -o json" "Get NooBaa accounts" 1 2>/dev/null); then
+        noobaa_accounts_count=$(echo "${noobaa_accounts}" | jq '.items | length' 2>/dev/null || echo "0")
+        log_debug "Found ${noobaa_accounts_count} NooBaa accounts"
+    fi
+    
+    # Check Object Bucket Claims (OBCs)
+    local object_bucket_claims=""
+    if object_bucket_claims=$(execute_oc_json "get objectbucketclaim -A -o json" "Get Object Bucket Claims" 1 2>/dev/null); then
+        object_bucket_claims_count=$(echo "${object_bucket_claims}" | jq '.items | length' 2>/dev/null || echo "0")
+        log_debug "Found ${object_bucket_claims_count} Object Bucket Claims"
+    fi
+    
+    # Check Bucket Claims (legacy)
+    local bucket_claims=""
+    if bucket_claims=$(execute_oc_json "get bucketclaim -A -o json" "Get Bucket Claims" 1 2>/dev/null); then
+        bucket_claims_count=$(echo "${bucket_claims}" | jq '.items | length' 2>/dev/null || echo "0")
+        log_debug "Found ${bucket_claims_count} Bucket Claims"
+    fi
+    
+    # Check MCG (Multi-Cloud Gateway) pods using multiple approaches
+    local mcg_pods=""
+    local mcg_found=false
+    local mcg_pod_details=""
+    
+    # Method 1: Check for NooBaa core pods (traditional approach)
+    if mcg_pods=$(execute_oc_json "get pods -A -l app=noobaa-core -o json" "Get NooBaa core pods" 1 2>/dev/null); then
+        local mcg_pod_count
+        mcg_pod_count=$(echo "${mcg_pods}" | jq '.items | length' 2>/dev/null || echo "0")
+        
+        if [[ "${mcg_pod_count}" -gt 0 ]]; then
+            mcg_found=true
+            # Check if MCG pods are running
+            local running_mcg_pods
+            running_mcg_pods=$(echo "${mcg_pods}" | jq '[.items[] | select(.status.phase == "Running")] | length' 2>/dev/null || echo "0")
+            
+            if [[ "${running_mcg_pods}" -eq "${mcg_pod_count}" ]]; then
+                mcg_status="running"
+            elif [[ "${running_mcg_pods}" -gt 0 ]]; then
+                mcg_status="partial"
+            else
+                mcg_status="not_running"
+            fi
+            
+            mcg_pod_details="noobaa-core: ${running_mcg_pods}/${mcg_pod_count}"
+            log_debug "MCG pods (noobaa-core): ${running_mcg_pods}/${mcg_pod_count} running"
+        fi
+    fi
+    
+    # Method 2: Check for NooBaa endpoint pods if core pods not found
+    if [[ "${mcg_found}" == "false" ]]; then
+        if mcg_pods=$(execute_oc_json "get pods -A -l app=noobaa-endpoint -o json" "Get NooBaa endpoint pods" 1 2>/dev/null); then
+            local mcg_pod_count
+            mcg_pod_count=$(echo "${mcg_pods}" | jq '.items | length' 2>/dev/null || echo "0")
+            
+            if [[ "${mcg_pod_count}" -gt 0 ]]; then
+                mcg_found=true
+                local running_mcg_pods
+                running_mcg_pods=$(echo "${mcg_pods}" | jq '[.items[] | select(.status.phase == "Running")] | length' 2>/dev/null || echo "0")
+                
+                if [[ "${running_mcg_pods}" -eq "${mcg_pod_count}" ]]; then
+                    mcg_status="running"
+                elif [[ "${running_mcg_pods}" -gt 0 ]]; then
+                    mcg_status="partial"
+                else
+                    mcg_status="not_running"
+                fi
+                
+                mcg_pod_details="noobaa-endpoint: ${running_mcg_pods}/${mcg_pod_count}"
+                log_debug "MCG pods (noobaa-endpoint): ${running_mcg_pods}/${mcg_pod_count} running"
+            fi
+        fi
+    fi
+    
+    # Method 3: Check for any NooBaa-related pods in openshift-storage namespace
+    if [[ "${mcg_found}" == "false" ]]; then
+        if mcg_pods=$(execute_oc_json "get pods -n openshift-storage -o json" "Get all pods in openshift-storage" 1 2>/dev/null); then
+            # Filter for NooBaa-related pods
+            local noobaa_pods
+            noobaa_pods=$(echo "${mcg_pods}" | jq '[.items[] | select(.metadata.name | test("noobaa"))]' 2>/dev/null || echo "[]")
+            
+            local mcg_pod_count
+            mcg_pod_count=$(echo "${noobaa_pods}" | jq 'length' 2>/dev/null || echo "0")
+            
+            if [[ "${mcg_pod_count}" -gt 0 ]]; then
+                mcg_found=true
+                local running_mcg_pods
+                running_mcg_pods=$(echo "${noobaa_pods}" | jq '[.[] | select(.status.phase == "Running")] | length' 2>/dev/null || echo "0")
+                
+                if [[ "${running_mcg_pods}" -eq "${mcg_pod_count}" ]]; then
+                    mcg_status="running"
+                elif [[ "${running_mcg_pods}" -gt 0 ]]; then
+                    mcg_status="partial"
+                else
+                    mcg_status="not_running"
+                fi
+                
+                mcg_pod_details="noobaa-pods: ${running_mcg_pods}/${mcg_pod_count}"
+                log_debug "MCG pods (noobaa namespace search): ${running_mcg_pods}/${mcg_pod_count} running"
+            fi
+        fi
+    fi
+    
+    # Method 4: Check for NooBaa operator pods
+    if [[ "${mcg_found}" == "false" ]]; then
+        if mcg_pods=$(execute_oc_json "get pods -A -l app=noobaa-operator -o json" "Get NooBaa operator pods" 1 2>/dev/null); then
+            local mcg_pod_count
+            mcg_pod_count=$(echo "${mcg_pods}" | jq '.items | length' 2>/dev/null || echo "0")
+            
+            if [[ "${mcg_pod_count}" -gt 0 ]]; then
+                mcg_found=true
+                local running_mcg_pods
+                running_mcg_pods=$(echo "${mcg_pods}" | jq '[.items[] | select(.status.phase == "Running")] | length' 2>/dev/null || echo "0")
+                
+                if [[ "${running_mcg_pods}" -eq "${mcg_pod_count}" ]]; then
+                    mcg_status="operator_only"
+                elif [[ "${running_mcg_pods}" -gt 0 ]]; then
+                    mcg_status="operator_partial"
+                else
+                    mcg_status="operator_down"
+                fi
+                
+                mcg_pod_details="noobaa-operator: ${running_mcg_pods}/${mcg_pod_count}"
+                log_debug "MCG operator pods: ${running_mcg_pods}/${mcg_pod_count} running"
+            fi
+        fi
+    fi
+    
+    # Method 5: Check for NooBaa services
+    if [[ "${mcg_found}" == "false" ]]; then
+        local noobaa_services=""
+        if noobaa_services=$(execute_oc_json "get svc -n openshift-storage -o json" "Get services in openshift-storage" 1 2>/dev/null); then
+            local s3_service_count
+            s3_service_count=$(echo "${noobaa_services}" | jq '[.items[] | select(.metadata.name | test("s3|noobaa"))] | length' 2>/dev/null || echo "0")
+            
+            if [[ "${s3_service_count}" -gt 0 ]]; then
+                mcg_found=true
+                mcg_status="service_available"
+                mcg_pod_details="s3-services: ${s3_service_count}"
+                log_debug "Found ${s3_service_count} NooBaa/S3 services"
+            fi
+        fi
+    fi
+    
+    # Method 6: If NooBaa system is ready but no pods found, assume MCG is integrated
+    if [[ "${mcg_found}" == "false" && "${noobaa_status}" == "Ready" ]]; then
+        mcg_status="integrated"
+        mcg_pod_details="integrated with NooBaa system"
+        log_debug "NooBaa system is ready, assuming MCG is integrated"
+    fi
+    
+    # Method 7: Check for storage classes that indicate MCG presence
+    if [[ "${mcg_found}" == "false" ]]; then
+        local noobaa_sc=""
+        if noobaa_sc=$(execute_oc_json "get storageclass -o json" "Get storage classes for NooBaa detection" 1 2>/dev/null); then
+            local noobaa_sc_count
+            noobaa_sc_count=$(echo "${noobaa_sc}" | jq '[.items[] | select(.provisioner | test("noobaa"))] | length' 2>/dev/null || echo "0")
+            
+            if [[ "${noobaa_sc_count}" -gt 0 ]]; then
+                mcg_found=true
+                mcg_status="storage_class_available"
+                mcg_pod_details="noobaa-storageclass: ${noobaa_sc_count}"
+                log_debug "Found ${noobaa_sc_count} NooBaa storage classes"
+            fi
+        fi
+    fi
+    
+    # If still not found, set as not_found
+    if [[ "${mcg_found}" == "false" && "${mcg_status}" == "unknown" ]]; then
+        mcg_status="not_found"
+        if [[ -z "${noobaa_errors}" ]]; then
+            noobaa_errors="MCG components not detected"
+        fi
+    fi
+    
+    # Create comprehensive NooBaa/MCG result
+    local noobaa_result
+    noobaa_result=$(cat << EOF
+{
+    "noobaa_status": "${noobaa_status}",
+    "mcg_status": "${mcg_status}",
+    "s3_endpoint": "${s3_endpoint}",
+    "mcg_version": "${mcg_version}",
+    "bucket_claims_count": "${bucket_claims_count}",
+    "object_bucket_claims_count": "${object_bucket_claims_count}",
+    "noobaa_accounts_count": "${noobaa_accounts_count}",
+    "mcg_pod_details": "${mcg_pod_details}",
+    "noobaa_errors": "${noobaa_errors}",
+    "check_timestamp": "$(get_timestamp)"
+}
+EOF
+    )
+    
+    echo "${noobaa_result}"
+}
+
+# Check storage capacity and usage
+check_storage_capacity() {
+    log_debug "Checking ODF storage capacity and usage..."
+    
+    local total_capacity="unknown"
+    local used_capacity="unknown"
+    local pv_count="0"
+    local pvc_count="0"
+    local capacity_errors=""
+    
+    # Method 1: Try to get capacity from Ceph cluster status (most accurate)
+    log_debug "Attempting to get capacity from Ceph cluster status..."
+    local ceph_clusters=""
+    if ceph_clusters=$(execute_oc_json "get cephcluster -A -o json" "Get Ceph clusters for capacity" 1 2>/dev/null); then
+        local cluster_count
+        cluster_count=$(echo "${ceph_clusters}" | jq '.items | length' 2>/dev/null || echo "0")
+        
+        if [[ "${cluster_count}" -gt 0 ]]; then
+            # Try to get capacity from Ceph status
+            local ceph_capacity_bytes
+            ceph_capacity_bytes=$(echo "${ceph_clusters}" | jq -r '.items[0].status.ceph.capacity.bytesTotal' 2>/dev/null || echo "null")
+            
+            if [[ -n "${ceph_capacity_bytes}" && "${ceph_capacity_bytes}" != "null" && "${ceph_capacity_bytes}" != "0" ]]; then
+                total_capacity=$(format_bytes "${ceph_capacity_bytes}")
+                log_debug "Got total capacity from Ceph cluster: ${total_capacity}"
+            else
+                # Try alternative capacity field
+                local ceph_capacity_str
+                ceph_capacity_str=$(echo "${ceph_clusters}" | jq -r '.items[0].status.ceph.capacity.bytesTotalHuman' 2>/dev/null || echo "null")
+                
+                if [[ -n "${ceph_capacity_str}" && "${ceph_capacity_str}" != "null" ]]; then
+                    total_capacity="${ceph_capacity_str}"
+                    log_debug "Got total capacity from Ceph cluster (human readable): ${total_capacity}"
+                fi
+            fi
+            
+            # Try to get used capacity
+            local ceph_used_bytes
+            ceph_used_bytes=$(echo "${ceph_clusters}" | jq -r '.items[0].status.ceph.capacity.bytesUsed' 2>/dev/null || echo "null")
+            
+            if [[ -n "${ceph_used_bytes}" && "${ceph_used_bytes}" != "null" && "${ceph_used_bytes}" != "0" ]]; then
+                used_capacity=$(format_bytes "${ceph_used_bytes}")
+                log_debug "Got used capacity from Ceph cluster: ${used_capacity}"
+            else
+                # Try alternative used capacity field
+                local ceph_used_str
+                ceph_used_str=$(echo "${ceph_clusters}" | jq -r '.items[0].status.ceph.capacity.bytesUsedHuman' 2>/dev/null || echo "null")
+                
+                if [[ -n "${ceph_used_str}" && "${ceph_used_str}" != "null" ]]; then
+                    used_capacity="${ceph_used_str}"
+                    log_debug "Got used capacity from Ceph cluster (human readable): ${used_capacity}"
+                fi
+            fi
+        fi
+    fi
+    
+    # Method 2: Try to get capacity from StorageCluster if Ceph method failed
+    if [[ "${total_capacity}" == "unknown" ]]; then
+        log_debug "Attempting to get capacity from StorageCluster..."
+        local storage_clusters=""
+        if storage_clusters=$(execute_oc_json "get storagecluster -A -o json" "Get storage clusters for capacity" 1 2>/dev/null); then
+            local sc_count
+            sc_count=$(echo "${storage_clusters}" | jq '.items | length' 2>/dev/null || echo "0")
+            
+            if [[ "${sc_count}" -gt 0 ]]; then
+                # Try to get capacity from storage cluster status
+                local sc_capacity
+                sc_capacity=$(echo "${storage_clusters}" | jq -r '.items[0].status.capacity.bytesTotal' 2>/dev/null || echo "null")
+                
+                if [[ -n "${sc_capacity}" && "${sc_capacity}" != "null" && "${sc_capacity}" != "0" ]]; then
+                    total_capacity=$(format_bytes "${sc_capacity}")
+                    log_debug "Got total capacity from StorageCluster: ${total_capacity}"
+                fi
+                
+                # Try to get used capacity from storage cluster
+                local sc_used
+                sc_used=$(echo "${storage_clusters}" | jq -r '.items[0].status.capacity.bytesUsed' 2>/dev/null || echo "null")
+                
+                if [[ -n "${sc_used}" && "${sc_used}" != "null" && "${sc_used}" != "0" ]]; then
+                    used_capacity=$(format_bytes "${sc_used}")
+                    log_debug "Got used capacity from StorageCluster: ${used_capacity}"
+                fi
+            fi
+        fi
+    fi
+    
+    # Method 3: Try to get capacity from OCS metrics or alternative sources
+    if [[ "${total_capacity}" == "unknown" ]]; then
+        log_debug "Attempting to get capacity from alternative sources..."
+        
+        # Try to get capacity from ceph status command via toolbox
+        local ceph_status=""
+        if ceph_status=$(execute_oc_command "get pods -n openshift-storage -l app=rook-ceph-tools --no-headers 2>/dev/null | head -1 | awk '{print \$1}'" "Get Ceph toolbox pod" 1 2>/dev/null); then
+            if [[ -n "${ceph_status}" && "${ceph_status}" != "No resources found" ]]; then
+                log_debug "Found Ceph toolbox pod: ${ceph_status}"
+                
+                # Try to execute ceph df command
+                local ceph_df=""
+                if ceph_df=$(execute_oc_command "exec -n openshift-storage ${ceph_status} -- ceph df --format json 2>/dev/null" "Get Ceph df" 1 2>/dev/null); then
+                    local ceph_total_bytes
+                    ceph_total_bytes=$(echo "${ceph_df}" | jq -r '.stats.total_bytes' 2>/dev/null || echo "null")
+                    
+                    if [[ -n "${ceph_total_bytes}" && "${ceph_total_bytes}" != "null" && "${ceph_total_bytes}" != "0" ]]; then
+                        total_capacity=$(format_bytes "${ceph_total_bytes}")
+                        log_debug "Got total capacity from ceph df: ${total_capacity}"
+                    fi
+                    
+                    local ceph_used_bytes
+                    ceph_used_bytes=$(echo "${ceph_df}" | jq -r '.stats.total_used_bytes' 2>/dev/null || echo "null")
+                    
+                    if [[ -n "${ceph_used_bytes}" && "${ceph_used_bytes}" != "null" && "${ceph_used_bytes}" != "0" ]]; then
+                        used_capacity=$(format_bytes "${ceph_used_bytes}")
+                        log_debug "Got used capacity from ceph df: ${used_capacity}"
+                    fi
+                fi
+            fi
+        fi
+    fi
+    
+    # Count PVs created by ODF (for reference, not for capacity calculation)
+    local odf_pvs=""
+    if odf_pvs=$(execute_oc_json "get pv -o json" "Get persistent volumes" 1 2>/dev/null); then
+        # Count PVs with ODF/OCS provisioners
+        pv_count=$(echo "${odf_pvs}" | jq '[.items[] | select(.spec.storageClassName | test("ocs-|odf-|ceph|rbd|cephfs|noobaa"))] | length' 2>/dev/null || echo "0")
+        log_debug "Found ${pv_count} ODF-provisioned PVs"
+    else
+        capacity_errors="Failed to retrieve persistent volumes"
+    fi
+    
+    # Count PVCs using ODF storage classes
+    local odf_pvcs=""
+    if odf_pvcs=$(execute_oc_json "get pvc -A -o json" "Get persistent volume claims" 1 2>/dev/null); then
+        pvc_count=$(echo "${odf_pvcs}" | jq '[.items[] | select(.spec.storageClassName | test("ocs-|odf-|ceph|rbd|cephfs|noobaa"))] | length' 2>/dev/null || echo "0")
+        log_debug "Found ${pvc_count} PVCs using ODF storage classes"
+    else
+        if [[ -z "${capacity_errors}" ]]; then
+            capacity_errors="Failed to retrieve persistent volume claims"
+        fi
+    fi
+    
+    # If we still don't have capacity, try one more method using storage class information
+    if [[ "${total_capacity}" == "unknown" ]]; then
+        log_debug "Attempting to estimate capacity from storage device sets..."
+        
+        local storage_clusters=""
+        if storage_clusters=$(execute_oc_json "get storagecluster -A -o json" "Get storage clusters for device sets" 1 2>/dev/null); then
+            local sc_count
+            sc_count=$(echo "${storage_clusters}" | jq '.items | length' 2>/dev/null || echo "0")
+            
+            if [[ "${sc_count}" -gt 0 ]]; then
+                # Try to calculate from storage device sets
+                local device_sets
+                device_sets=$(echo "${storage_clusters}" | jq '.items[0].spec.storageDeviceSets' 2>/dev/null || echo "[]")
+                
+                if [[ "${device_sets}" != "[]" && "${device_sets}" != "null" ]]; then
+                    # This is an estimation - get device size and count
+                    local total_estimated_bytes=0
+                    local device_count
+                    device_count=$(echo "${device_sets}" | jq 'length' 2>/dev/null || echo "0")
+                    
+                    for ((i=0; i<device_count; i++)); do
+                        local device_size
+                        local device_count_per_set
+                        local replica_count
+                        
+                        device_size=$(echo "${device_sets}" | jq -r ".[${i}].dataPVCTemplate.spec.resources.requests.storage" 2>/dev/null || echo "0")
+                        device_count_per_set=$(echo "${device_sets}" | jq -r ".[${i}].count" 2>/dev/null || echo "0")
+                        replica_count=$(echo "${device_sets}" | jq -r ".[${i}].replica" 2>/dev/null || echo "1")
+                        
+                        if [[ -n "${device_size}" && "${device_size}" != "null" && "${device_size}" != "0" ]]; then
+                            # Convert device size to bytes (simplified conversion)
+                            local size_bytes
+                            if [[ "${device_size}" =~ ([0-9]+)Ti ]]; then
+                                size_bytes=$((${BASH_REMATCH[1]} * 1024 * 1024 * 1024 * 1024))
+                            elif [[ "${device_size}" =~ ([0-9]+)Gi ]]; then
+                                size_bytes=$((${BASH_REMATCH[1]} * 1024 * 1024 * 1024))
+                            elif [[ "${device_size}" =~ ([0-9]+)Mi ]]; then
+                                size_bytes=$((${BASH_REMATCH[1]} * 1024 * 1024))
+                            else
+                                size_bytes=0
+                            fi
+                            
+                            if [[ "${size_bytes}" -gt 0 ]]; then
+                                local set_total_bytes=$((size_bytes * device_count_per_set * replica_count))
+                                total_estimated_bytes=$((total_estimated_bytes + set_total_bytes))
+                            fi
+                        fi
+                    done
+                    
+                    if [[ "${total_estimated_bytes}" -gt 0 ]]; then
+                        total_capacity="~$(format_bytes "${total_estimated_bytes}") (estimated)"
+                        log_debug "Estimated total capacity from device sets: ${total_capacity}"
+                    fi
+                fi
+            fi
+        fi
+    fi
+    
+    # Create capacity result
+    local capacity_result
+    capacity_result=$(cat << EOF
+{
+    "total_capacity": "${total_capacity}",
+    "used_capacity": "${used_capacity}",
+    "pv_count": "${pv_count}",
+    "pvc_count": "${pvc_count}",
+    "capacity_errors": "${capacity_errors}",
+    "check_timestamp": "$(get_timestamp)"
+}
+EOF
+    )
+    
+    echo "${capacity_result}"
+}
+
+# Check ODF status across the cluster
+check_odf_status() {
+    log_info "Checking OpenShift Data Foundation (ODF) status..."
+    
+    # Reset ODF status
+    odf_status["overall_status"]="${STATUS_UNKNOWN}"
+    odf_status["overall_message"]=""
+    odf_status["odf_installed"]="unknown"
+    odf_status["odf_version"]="unknown"
+    odf_status["deployment_mode"]="unknown"
+    odf_status["storage_cluster_status"]="unknown"
+    odf_status["storage_cluster_name"]="unknown"
+    odf_status["ceph_cluster_health"]="unknown"
+    odf_status["noobaa_status"]="unknown"
+    odf_status["mcg_status"]="unknown"
+    odf_status["s3_endpoint"]="unknown"
+    odf_status["mcg_version"]="unknown"
+    odf_status["bucket_claims_count"]="0"
+    odf_status["object_bucket_claims_count"]="0"
+    odf_status["noobaa_accounts_count"]="0"
+    odf_status["mcg_pod_details"]=""
+    odf_status["odf_operator_status"]="unknown"
+    odf_status["ocs_operator_status"]="unknown"
+    odf_status["storage_nodes_count"]="0"
+    odf_status["storage_capacity_total"]="unknown"
+    odf_status["storage_capacity_used"]="unknown"
+    odf_status["pv_count"]="0"
+    odf_status["pvc_count"]="0"
+    odf_status["check_timestamp"]="$(get_timestamp)"
+    odf_status["details"]=""
+    odf_status["errors"]=""
+    
+    local error_messages=()
+    local all_checks_successful=true
+    
+    # Check ODF operator installation
+    log_debug "Checking ODF operator installation..."
+    local operator_result=""
+    if operator_result=$(check_odf_operator); then
+        local odf_operator_found
+        local ocs_operator_found
+        local odf_version
+        local operator_errors
+        
+        odf_operator_found=$(parse_json_field "${operator_result}" ".odf_operator_found" "false" "ODF operator found")
+        ocs_operator_found=$(parse_json_field "${operator_result}" ".ocs_operator_found" "false" "OCS operator found")
+        odf_version=$(parse_json_field "${operator_result}" ".odf_version" "unknown" "ODF version")
+        operator_errors=$(parse_json_field "${operator_result}" ".operator_errors" "" "operator errors")
+        
+        if [[ "${odf_operator_found}" == "true" ]]; then
+            odf_status["odf_installed"]="true"
+            odf_status["odf_operator_status"]="installed"
+        elif [[ "${ocs_operator_found}" == "true" ]]; then
+            odf_status["odf_installed"]="true"
+            odf_status["ocs_operator_status"]="installed"
+        else
+            odf_status["odf_installed"]="false"
+        fi
+        
+        odf_status["odf_version"]="${odf_version}"
+        
+        if [[ -n "${operator_errors}" ]]; then
+            error_messages+=("Operator check: ${operator_errors}")
+        fi
+    else
+        error_messages+=("Failed to check ODF operator installation")
+        all_checks_successful=false
+    fi
+    
+    # Only proceed with other checks if ODF is installed
+    if [[ "${odf_status["odf_installed"]}" == "true" ]]; then
+        # Check storage cluster
+        log_debug "Checking storage cluster configuration..."
+        local cluster_result=""
+        if cluster_result=$(check_storage_cluster); then
+            local storage_cluster_found
+            local storage_cluster_name
+            local storage_cluster_status
+            local deployment_mode
+            local storage_nodes_count
+            local cluster_errors
+            
+            storage_cluster_found=$(parse_json_field "${cluster_result}" ".storage_cluster_found" "false" "storage cluster found")
+            storage_cluster_name=$(parse_json_field "${cluster_result}" ".storage_cluster_name" "unknown" "storage cluster name")
+            storage_cluster_status=$(parse_json_field "${cluster_result}" ".storage_cluster_status" "unknown" "storage cluster status")
+            deployment_mode=$(parse_json_field "${cluster_result}" ".deployment_mode" "unknown" "deployment mode")
+            storage_nodes_count=$(parse_json_field "${cluster_result}" ".storage_nodes_count" "0" "storage nodes count")
+            cluster_errors=$(parse_json_field "${cluster_result}" ".cluster_errors" "" "cluster errors")
+            
+            odf_status["storage_cluster_name"]="${storage_cluster_name}"
+            odf_status["storage_cluster_status"]="${storage_cluster_status}"
+            odf_status["deployment_mode"]="${deployment_mode}"
+            odf_status["storage_nodes_count"]="${storage_nodes_count}"
+            
+            if [[ -n "${cluster_errors}" ]]; then
+                error_messages+=("Storage cluster check: ${cluster_errors}")
+            fi
+        else
+            error_messages+=("Failed to check storage cluster")
+        fi
+        
+        # Check Ceph cluster health
+        log_debug "Checking Ceph cluster health..."
+        local health_result=""
+        if health_result=$(check_ceph_cluster_health); then
+            local ceph_health
+            local ceph_status
+            local health_errors
+            
+            ceph_health=$(parse_json_field "${health_result}" ".ceph_health" "unknown" "Ceph health")
+            ceph_status=$(parse_json_field "${health_result}" ".ceph_status" "unknown" "Ceph status")
+            health_errors=$(parse_json_field "${health_result}" ".health_errors" "" "health errors")
+            
+            odf_status["ceph_cluster_health"]="${ceph_health}"
+            
+            if [[ -n "${health_errors}" ]]; then
+                error_messages+=("Ceph health check: ${health_errors}")
+            fi
+        else
+            error_messages+=("Failed to check Ceph cluster health")
+        fi
+        
+        # Check NooBaa and MCG status
+        log_debug "Checking NooBaa and MCG status..."
+        local noobaa_result=""
+        if noobaa_result=$(check_noobaa_mcg_status); then
+            local noobaa_status_val
+            local mcg_status_val
+            local s3_endpoint_val
+            local mcg_version_val
+            local bucket_claims_count_val
+            local object_bucket_claims_count_val
+            local noobaa_accounts_count_val
+            local mcg_pod_details_val
+            local noobaa_errors
+            
+            noobaa_status_val=$(parse_json_field "${noobaa_result}" ".noobaa_status" "unknown" "NooBaa status")
+            mcg_status_val=$(parse_json_field "${noobaa_result}" ".mcg_status" "unknown" "MCG status")
+            s3_endpoint_val=$(parse_json_field "${noobaa_result}" ".s3_endpoint" "unknown" "S3 endpoint")
+            mcg_version_val=$(parse_json_field "${noobaa_result}" ".mcg_version" "unknown" "MCG version")
+            bucket_claims_count_val=$(parse_json_field "${noobaa_result}" ".bucket_claims_count" "0" "Bucket claims count")
+            object_bucket_claims_count_val=$(parse_json_field "${noobaa_result}" ".object_bucket_claims_count" "0" "Object bucket claims count")
+            noobaa_accounts_count_val=$(parse_json_field "${noobaa_result}" ".noobaa_accounts_count" "0" "NooBaa accounts count")
+            mcg_pod_details_val=$(parse_json_field "${noobaa_result}" ".mcg_pod_details" "" "MCG pod details")
+            noobaa_errors=$(parse_json_field "${noobaa_result}" ".noobaa_errors" "" "NooBaa errors")
+            
+            odf_status["noobaa_status"]="${noobaa_status_val}"
+            odf_status["mcg_status"]="${mcg_status_val}"
+            odf_status["s3_endpoint"]="${s3_endpoint_val}"
+            odf_status["mcg_version"]="${mcg_version_val}"
+            odf_status["bucket_claims_count"]="${bucket_claims_count_val}"
+            odf_status["object_bucket_claims_count"]="${object_bucket_claims_count_val}"
+            odf_status["noobaa_accounts_count"]="${noobaa_accounts_count_val}"
+            odf_status["mcg_pod_details"]="${mcg_pod_details_val}"
+            
+            if [[ -n "${noobaa_errors}" ]]; then
+                error_messages+=("NooBaa/MCG check: ${noobaa_errors}")
+            fi
+        else
+            error_messages+=("Failed to check NooBaa and MCG status")
+        fi
+        
+        # Check storage capacity
+        log_debug "Checking storage capacity..."
+        local capacity_result=""
+        if capacity_result=$(check_storage_capacity); then
+            local total_capacity
+            local used_capacity
+            local pv_count
+            local pvc_count
+            local capacity_errors
+            
+            total_capacity=$(parse_json_field "${capacity_result}" ".total_capacity" "unknown" "total capacity")
+            used_capacity=$(parse_json_field "${capacity_result}" ".used_capacity" "unknown" "used capacity")
+            pv_count=$(parse_json_field "${capacity_result}" ".pv_count" "0" "PV count")
+            pvc_count=$(parse_json_field "${capacity_result}" ".pvc_count" "0" "PVC count")
+            capacity_errors=$(parse_json_field "${capacity_result}" ".capacity_errors" "" "capacity errors")
+            
+            odf_status["storage_capacity_total"]="${total_capacity}"
+            odf_status["storage_capacity_used"]="${used_capacity}"
+            odf_status["pv_count"]="${pv_count}"
+            odf_status["pvc_count"]="${pvc_count}"
+            
+            if [[ -n "${capacity_errors}" ]]; then
+                error_messages+=("Capacity check: ${capacity_errors}")
+            fi
+        else
+            error_messages+=("Failed to check storage capacity")
+        fi
+    fi
+    
+    # Create detailed results
+    local details_result
+    details_result=$(cat << EOF
+{
+    "operator_check": ${operator_result:-"{}"},
+    "cluster_check": ${cluster_result:-"{}"},
+    "health_check": ${health_result:-"{}"},
+    "noobaa_check": ${noobaa_result:-"{}"},
+    "capacity_check": ${capacity_result:-"{}"}
+}
+EOF
+    )
+    odf_status["details"]="${details_result}"
+    
+    # Combine error messages
+    if [[ ${#error_messages[@]} -gt 0 ]]; then
+        odf_status["errors"]=$(IFS="; "; echo "${error_messages[*]}")
+    fi
+    
+    # Determine overall status
+    local overall_status="${STATUS_UNKNOWN}"
+    local overall_message=""
+    
+    if [[ "${odf_status["odf_installed"]}" == "false" ]]; then
+        overall_status="${STATUS_WARNING}"
+        overall_message="OpenShift Data Foundation (ODF) is not installed"
+    elif [[ "${odf_status["odf_installed"]}" == "true" ]]; then
+        local storage_cluster_status="${odf_status["storage_cluster_status"]}"
+        local ceph_health="${odf_status["ceph_cluster_health"]}"
+        local deployment_mode="${odf_status["deployment_mode"]}"
+        
+        if [[ "${storage_cluster_status}" == "Ready" && "${ceph_health}" == "HEALTH_OK" ]]; then
+            overall_status="${STATUS_HEALTHY}"
+            overall_message="ODF is healthy (${deployment_mode} mode) with ${odf_status["storage_nodes_count"]} storage nodes"
+        elif [[ "${storage_cluster_status}" == "Ready" ]]; then
+            overall_status="${STATUS_WARNING}"
+            overall_message="ODF storage cluster is ready but Ceph health needs attention (${ceph_health})"
+        elif [[ "${storage_cluster_status}" != "unknown" ]]; then
+            overall_status="${STATUS_WARNING}"
+            overall_message="ODF storage cluster status: ${storage_cluster_status}"
+        else
+            overall_status="${STATUS_CRITICAL}"
+            overall_message="ODF is installed but storage cluster status is unknown"
+        fi
+    else
+        overall_status="${STATUS_UNKNOWN}"
+        overall_message="Unable to determine ODF installation status"
+    fi
+    
+    # Update overall status
+    odf_status["overall_status"]="${overall_status}"
+    odf_status["overall_message"]="${overall_message}"
+    
+    # Log summary
+    log_info "ODF status check completed:"
+    log_info "  ODF installed: ${odf_status["odf_installed"]}"
+    log_info "  ODF version: ${odf_status["odf_version"]}"
+    log_info "  Deployment mode: ${odf_status["deployment_mode"]}"
+    log_info "  Storage cluster: ${odf_status["storage_cluster_name"]} (${odf_status["storage_cluster_status"]})"
+    log_info "  Ceph health: ${odf_status["ceph_cluster_health"]}"
+    log_info "  NooBaa status: ${odf_status["noobaa_status"]}"
+    log_info "  MCG status: ${odf_status["mcg_status"]}"
+    log_info "  Storage nodes: ${odf_status["storage_nodes_count"]}"
+    log_info "  PVs/PVCs: ${odf_status["pv_count"]}/${odf_status["pvc_count"]}"
+    log_info "  Overall status: ${overall_status}"
+    
+    case "${overall_status}" in
+        "${STATUS_HEALTHY}")
+            log_success "${overall_message}"
+            ;;
+        "${STATUS_WARNING}")
+            log_warn "${overall_message}"
+            ;;
+        "${STATUS_CRITICAL}")
+            log_error "${overall_message}"
+            ;;
+        *)
+            log_warn "${overall_message}"
+            ;;
+    esac
+    
+    return 0
+}
+
+# Get ODF status summary
+get_odf_status_summary() {
+    local format="${1:-text}"
+    
+    case "${format}" in
+        "json")
+            cat << EOF
+{
+    "overall_status": "${odf_status["overall_status"]}",
+    "overall_message": "${odf_status["overall_message"]}",
+    "odf_installed": "${odf_status["odf_installed"]}",
+    "odf_version": "${odf_status["odf_version"]}",
+    "deployment_mode": "${odf_status["deployment_mode"]}",
+    "storage_cluster_status": "${odf_status["storage_cluster_status"]}",
+    "storage_cluster_name": "${odf_status["storage_cluster_name"]}",
+    "ceph_cluster_health": "${odf_status["ceph_cluster_health"]}",
+    "noobaa_status": "${odf_status["noobaa_status"]}",
+    "mcg_status": "${odf_status["mcg_status"]}",
+    "s3_endpoint": "${odf_status["s3_endpoint"]}",
+    "mcg_version": "${odf_status["mcg_version"]}",
+    "bucket_claims_count": "${odf_status["bucket_claims_count"]}",
+    "object_bucket_claims_count": "${odf_status["object_bucket_claims_count"]}",
+    "noobaa_accounts_count": "${odf_status["noobaa_accounts_count"]}",
+    "mcg_pod_details": "${odf_status["mcg_pod_details"]}",
+    "storage_nodes_count": "${odf_status["storage_nodes_count"]}",
+    "storage_capacity_total": "${odf_status["storage_capacity_total"]}",
+    "pv_count": "${odf_status["pv_count"]}",
+    "pvc_count": "${odf_status["pvc_count"]}",
+    "check_timestamp": "${odf_status["check_timestamp"]}",
+    "details": ${odf_status["details"]:-"{}"},
+    "errors": "${odf_status["errors"]}"
+}
+EOF
+            ;;
+        "text"|*)
+            cat << EOF
+ODF Status: ${odf_status["overall_status"]}
+Message: ${odf_status["overall_message"]}
+ODF Installed: ${odf_status["odf_installed"]}
+ODF Version: ${odf_status["odf_version"]}
+Deployment Mode: ${odf_status["deployment_mode"]}
+Storage Cluster: ${odf_status["storage_cluster_name"]} (${odf_status["storage_cluster_status"]})
+Ceph Health: ${odf_status["ceph_cluster_health"]}
+NooBaa Status: ${odf_status["noobaa_status"]}
+MCG Status: ${odf_status["mcg_status"]}
+Storage Nodes: ${odf_status["storage_nodes_count"]}
+Total Capacity: ${odf_status["storage_capacity_total"]}
+PVs/PVCs: ${odf_status["pv_count"]}/${odf_status["pvc_count"]}
+Check Timestamp: ${odf_status["check_timestamp"]}
+EOF
+            if [[ -n "${odf_status["errors"]}" ]]; then
+                echo "Errors: ${odf_status["errors"]}"
+            fi
+            ;;
+    esac
+}
+
+# =============================================================================
+# POD NETWORK DETAILS MODULE
+# =============================================================================
+
+# Pod network status structure
+declare -A pod_network_status=(
+    ["overall_status"]="${STATUS_UNKNOWN}"
+    ["overall_message"]=""
+    ["network_type"]="unknown"
+    ["cluster_network_cidr"]="unknown"
+    ["service_network_cidr"]="unknown"
+    ["host_prefix"]="unknown"
+    ["pod_subnet_size"]="unknown"
+    ["total_pods"]="0"
+    ["running_pods"]="0"
+    ["pending_pods"]="0"
+    ["failed_pods"]="0"
+    ["nodes_with_pods"]="0"
+    ["total_nodes"]="0"
+    ["network_plugin"]="unknown"
+    ["mtu_size"]="unknown"
+    ["check_timestamp"]=""
+    ["details"]=""
+    ["errors"]=""
+)
+
+# Get cluster network configuration
+get_cluster_network_config() {
+    log_debug "Getting cluster network configuration..."
+    
+    local network_type="unknown"
+    local cluster_cidr="unknown"
+    local service_cidr="unknown"
+    local host_prefix="unknown"
+    local mtu_size="unknown"
+    local network_errors=""
+    
+    # Get network configuration from cluster network operator
+    local network_config=""
+    if network_config=$(execute_oc_json "get networks.operator.openshift.io cluster -o json" "Get cluster network config" 1 2>/dev/null); then
+        # Extract network type
+        network_type=$(parse_json_field "${network_config}" ".spec.defaultNetwork.type" "unknown" "network type")
+        
+        # Extract cluster network CIDR
+        local cluster_networks
+        cluster_networks=$(parse_json_field "${network_config}" ".spec.clusterNetwork" "[]" "cluster networks")
+        
+        if [[ "${cluster_networks}" != "[]" && "${cluster_networks}" != "null" ]]; then
+            cluster_cidr=$(echo "${cluster_networks}" | jq -r '.[0].cidr' 2>/dev/null || echo "unknown")
+            host_prefix=$(echo "${cluster_networks}" | jq -r '.[0].hostPrefix' 2>/dev/null || echo "unknown")
+        fi
+        
+        # Extract service network CIDR
+        local service_networks
+        service_networks=$(parse_json_field "${network_config}" ".spec.serviceNetwork" "[]" "service networks")
+        
+        if [[ "${service_networks}" != "[]" && "${service_networks}" != "null" ]]; then
+            service_cidr=$(echo "${service_networks}" | jq -r '.[0]' 2>/dev/null || echo "unknown")
+        fi
+        
+        # Extract MTU size from clusterNetworkMTU (correct field from network.config.openshift.io)
+        local network_config_mtu=""
+        if network_config_mtu=$(execute_oc_json "get networks.config.openshift.io cluster -o json" "Get network config for MTU" 1 2>/dev/null); then
+            mtu_size=$(parse_json_field "${network_config_mtu}" ".status.clusterNetworkMTU" "unknown" "cluster network MTU")
+            log_debug "Retrieved MTU from clusterNetworkMTU: ${mtu_size}"
+        fi
+        
+        # If clusterNetworkMTU is not available, try the network-specific MTU as fallback
+        if [[ "${mtu_size}" == "unknown" ]]; then
+            if [[ "${network_type}" == "OVNKubernetes" ]]; then
+                mtu_size=$(parse_json_field "${network_config}" ".spec.defaultNetwork.ovnKubernetesConfig.mtu" "unknown" "OVN MTU size")
+                log_debug "Retrieved MTU from OVN config: ${mtu_size}"
+            elif [[ "${network_type}" == "OpenShiftSDN" ]]; then
+                mtu_size=$(parse_json_field "${network_config}" ".spec.defaultNetwork.openshiftSDNConfig.mtu" "unknown" "SDN MTU size")
+                log_debug "Retrieved MTU from SDN config: ${mtu_size}"
+            fi
+        fi
+        
+        log_debug "Network config - Type: ${network_type}, Cluster CIDR: ${cluster_cidr}, Service CIDR: ${service_cidr}"
+    else
+        network_errors="Failed to retrieve cluster network configuration"
+    fi
+    
+    # Create network config result
+    local network_result
+    network_result=$(cat << EOF
+{
+    "network_type": "${network_type}",
+    "cluster_cidr": "${cluster_cidr}",
+    "service_cidr": "${service_cidr}",
+    "host_prefix": "${host_prefix}",
+    "mtu_size": "${mtu_size}",
+    "network_errors": "${network_errors}",
+    "check_timestamp": "$(get_timestamp)"
+}
+EOF
+    )
+    
+    echo "${network_result}"
+}
+
+# Get pod CIDR for a specific node using multiple detection methods
+get_node_pod_cidr() {
+    local all_nodes_json="$1"
+    local node_index="$2"
+    local node_name="$3"
+    
+    log_debug "Getting pod CIDR for node: ${node_name}"
+    
+    local pod_cidr="unknown"
+    
+    # Method 1: Check spec.podCIDR (standard Kubernetes field)
+    pod_cidr=$(echo "${all_nodes_json}" | jq -r ".items[${node_index}].spec.podCIDR" 2>/dev/null || echo "null")
+    
+    if [[ "${pod_cidr}" != "null" && "${pod_cidr}" != "unknown" && -n "${pod_cidr}" ]]; then
+        log_debug "Found pod CIDR via spec.podCIDR for ${node_name}: ${pod_cidr}"
+        echo "${pod_cidr}"
+        return 0
+    fi
+    
+    # Method 2: Check node annotations for pod CIDR
+    log_debug "Trying to get pod CIDR from annotations for ${node_name}"
+    local annotations
+    annotations=$(echo "${all_nodes_json}" | jq -r ".items[${node_index}].metadata.annotations" 2>/dev/null || echo "{}")
+    
+    if [[ "${annotations}" != "{}" && "${annotations}" != "null" ]]; then
+        # Check common annotation keys for pod CIDR
+        local annotation_keys=("k8s.ovn.org/node-subnets" "ovn.kubernetes.io/node-subnets" "flannel.alpha.coreos.com/public-ip-overwrite" "projectcalico.org/IPv4Address")
+        
+        for key in "${annotation_keys[@]}"; do
+            local annotation_value
+            annotation_value=$(echo "${annotations}" | jq -r --arg key "${key}" '.[$key]' 2>/dev/null || echo "null")
+            
+            if [[ "${annotation_value}" != "null" && -n "${annotation_value}" ]]; then
+                # Parse the annotation value to extract CIDR
+                if [[ "${annotation_value}" =~ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+) ]]; then
+                    pod_cidr="${BASH_REMATCH[1]}"
+                    log_debug "Found pod CIDR via annotation ${key} for ${node_name}: ${pod_cidr}"
+                    echo "${pod_cidr}"
+                    return 0
+                fi
+            fi
+        done
+    fi
+    
+    # Method 3: Use oc describe to get pod CIDR (similar to your command)
+    log_debug "Trying to get pod CIDR via oc describe for ${node_name}"
+    local describe_output=""
+    if describe_output=$(execute_oc_command "describe node ${node_name}" "Describe node ${node_name}" 1 2>/dev/null); then
+        # Look for pod CIDR patterns in the describe output
+        # Common patterns: "PodCIDR:", "Pod CIDR:", or IP ranges like "10.88.x.x/24"
+        
+        # First try to find explicit PodCIDR field
+        if echo "${describe_output}" | grep -qi "PodCIDR"; then
+            local podcidr_line
+            podcidr_line=$(echo "${describe_output}" | grep -i "PodCIDR" | head -1)
+            
+            if [[ "${podcidr_line}" =~ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+) ]]; then
+                pod_cidr="${BASH_REMATCH[1]}"
+                log_debug "Found pod CIDR via describe PodCIDR for ${node_name}: ${pod_cidr}"
+                echo "${pod_cidr}"
+                return 0
+            fi
+        fi
+        
+        # Method 4: Look for specific CIDR patterns (like 10.88.x.x as in your example)
+        # Extract cluster network CIDR first to know what to look for
+        local cluster_cidr_prefix=""
+        local network_config=""
+        if network_config=$(execute_oc_json "get networks.operator.openshift.io cluster -o json" "Get cluster network for CIDR detection" 1 2>/dev/null); then
+            local cluster_networks
+            cluster_networks=$(echo "${network_config}" | jq -r '.spec.clusterNetwork[0].cidr' 2>/dev/null || echo "unknown")
+            
+            if [[ "${cluster_networks}" != "unknown" && "${cluster_networks}" =~ ^([0-9]+\.[0-9]+) ]]; then
+                cluster_cidr_prefix="${BASH_REMATCH[1]}"
+                log_debug "Cluster CIDR prefix detected: ${cluster_cidr_prefix}"
+                
+                # Look for this prefix in the node description
+                if echo "${describe_output}" | grep -q "${cluster_cidr_prefix}"; then
+                    local cidr_line
+                    cidr_line=$(echo "${describe_output}" | grep "${cluster_cidr_prefix}" | head -1)
+                    
+                    if [[ "${cidr_line}" =~ (${cluster_cidr_prefix}\.[0-9]+\.[0-9]+/[0-9]+) ]]; then
+                        pod_cidr="${BASH_REMATCH[1]}"
+                        log_debug "Found pod CIDR via cluster prefix match for ${node_name}: ${pod_cidr}"
+                        echo "${pod_cidr}"
+                        return 0
+                    fi
+                fi
+            fi
+        fi
+        
+        # Method 5: Generic CIDR pattern search in describe output
+        # Look for any CIDR that might be the pod CIDR
+        local cidr_candidates
+        cidr_candidates=$(echo "${describe_output}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' | head -5)
+        
+        if [[ -n "${cidr_candidates}" ]]; then
+            # Filter out common non-pod CIDRs (like service CIDRs)
+            while IFS= read -r candidate; do
+                # Skip empty lines
+                [[ -z "${candidate}" ]] && continue
+                
+                # Skip service network CIDRs (commonly 172.30.x.x or 10.96.x.x)
+                if [[ "${candidate}" =~ ^172\.30\. ]] || [[ "${candidate}" =~ ^10\.96\. ]]; then
+                    continue
+                fi
+                
+                # Skip host network CIDRs (commonly /16 or /8)
+                if [[ "${candidate}" =~ /([0-9]+)$ ]]; then
+                    local prefix="${BASH_REMATCH[1]}"
+                    if [[ "${prefix}" -le 16 ]]; then
+                        continue
+                    fi
+                fi
+                
+                # This looks like a potential pod CIDR
+                pod_cidr="${candidate}"
+                log_debug "Found potential pod CIDR via pattern search for ${node_name}: ${pod_cidr}"
+                echo "${pod_cidr}"
+                return 0
+            done <<< "${cidr_candidates}"
+        fi
+    fi
+    
+    # Method 6: Try to get CIDR from running pods on this node
+    log_debug "Trying to derive pod CIDR from running pods for ${node_name}"
+    local node_pods=""
+    if node_pods=$(execute_oc_json "get pods -A -o json --field-selector spec.nodeName=${node_name}" "Get pods on ${node_name}" 1 2>/dev/null); then
+        local pod_ips
+        pod_ips=$(echo "${node_pods}" | jq -r '.items[].status.podIP' 2>/dev/null | grep -v "null" | head -5)
+        
+        if [[ -n "${pod_ips}" ]]; then
+            # Analyze pod IPs to determine the likely CIDR
+            local first_pod_ip
+            first_pod_ip=$(echo "${pod_ips}" | head -1)
+            
+            if [[ "${first_pod_ip}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+$ ]]; then
+                local subnet_base="${BASH_REMATCH[1]}"
+                # Assume /24 subnet for pod CIDR (common default)
+                pod_cidr="${subnet_base}.0/24"
+                log_debug "Derived pod CIDR from pod IPs for ${node_name}: ${pod_cidr}"
+                echo "${pod_cidr}"
+                return 0
+            fi
+        fi
+    fi
+    
+    # If all methods fail, return unknown
+    log_debug "Could not determine pod CIDR for ${node_name}"
+    echo "unknown"
+    return 1
+}
+
+# Get pod distribution per node
+get_pod_distribution_per_node() {
+    log_debug "Getting pod distribution per node..."
+    
+    local node_details=()
+    local total_pods=0
+    local running_pods=0
+    local pending_pods=0
+    local failed_pods=0
+    local nodes_with_pods=0
+    local pod_errors=""
+    
+    # Get all pods across all namespaces
+    local all_pods=""
+    if all_pods=$(execute_oc_json "get pods -A -o json" "Get all pods" 1 2>/dev/null); then
+        # Get all nodes
+        local all_nodes=""
+        if all_nodes=$(execute_oc_json "get nodes -o json" "Get all nodes for pod distribution" 1 2>/dev/null); then
+            local node_count
+            node_count=$(echo "${all_nodes}" | jq '.items | length' 2>/dev/null || echo "0")
+            
+            # Process each node
+            for ((node_index=0; node_index<node_count; node_index++)); do
+                local node_name
+                local node_internal_ip
+                local node_pod_cidr
+                local node_allocatable_pods
+                
+                node_name=$(echo "${all_nodes}" | jq -r ".items[${node_index}].metadata.name" 2>/dev/null || echo "unknown")
+                node_internal_ip=$(echo "${all_nodes}" | jq -r ".items[${node_index}].status.addresses[] | select(.type==\"InternalIP\") | .address" 2>/dev/null || echo "unknown")
+                node_allocatable_pods=$(echo "${all_nodes}" | jq -r ".items[${node_index}].status.allocatable.pods" 2>/dev/null || echo "unknown")
+                
+                # Get pod CIDR for this node using multiple methods
+                node_pod_cidr=$(get_node_pod_cidr "${all_nodes}" "${node_index}" "${node_name}")
+                
+                # Count pods on this node by phase
+                local node_total_pods=0
+                local node_running_pods=0
+                local node_pending_pods=0
+                local node_failed_pods=0
+                local node_succeeded_pods=0
+                
+                # Filter pods for this node
+                local node_pods
+                node_pods=$(echo "${all_pods}" | jq --arg node_name "${node_name}" '[.items[] | select(.spec.nodeName == $node_name)]' 2>/dev/null || echo "[]")
+                
+                if [[ "${node_pods}" != "[]" ]]; then
+                    node_total_pods=$(echo "${node_pods}" | jq 'length' 2>/dev/null || echo "0")
+                    node_running_pods=$(echo "${node_pods}" | jq '[.[] | select(.status.phase == "Running")] | length' 2>/dev/null || echo "0")
+                    node_pending_pods=$(echo "${node_pods}" | jq '[.[] | select(.status.phase == "Pending")] | length' 2>/dev/null || echo "0")
+                    node_failed_pods=$(echo "${node_pods}" | jq '[.[] | select(.status.phase == "Failed")] | length' 2>/dev/null || echo "0")
+                    node_succeeded_pods=$(echo "${node_pods}" | jq '[.[] | select(.status.phase == "Succeeded")] | length' 2>/dev/null || echo "0")
+                fi
+                
+                # Calculate pod CIDR utilization
+                local pod_cidr_size="unknown"
+                local pod_utilization="unknown"
+                
+                if [[ "${node_pod_cidr}" != "unknown" ]]; then
+                    # Extract CIDR prefix to calculate available IPs
+                    if [[ "${node_pod_cidr}" =~ /([0-9]+)$ ]]; then
+                        local prefix="${BASH_REMATCH[1]}"
+                        local available_ips=$((2**(32-prefix) - 2))  # Subtract network and broadcast
+                        pod_cidr_size="${available_ips}"
+                        
+                        if [[ "${node_total_pods}" -gt 0 && "${available_ips}" -gt 0 ]]; then
+                            local utilization_percent=$((node_total_pods * 100 / available_ips))
+                            pod_utilization="${utilization_percent}%"
+                        else
+                            pod_utilization="0%"
+                        fi
+                    fi
+                fi
+                
+                # Update global counters
+                total_pods=$((total_pods + node_total_pods))
+                running_pods=$((running_pods + node_running_pods))
+                pending_pods=$((pending_pods + node_pending_pods))
+                failed_pods=$((failed_pods + node_failed_pods))
+                
+                if [[ "${node_total_pods}" -gt 0 ]]; then
+                    ((nodes_with_pods++))
+                fi
+                
+                # Create node detail
+                local node_detail
+                node_detail=$(cat << EOF
+{
+    "node_name": "${node_name}",
+    "internal_ip": "${node_internal_ip}",
+    "pod_cidr": "${node_pod_cidr}",
+    "pod_cidr_size": "${pod_cidr_size}",
+    "pod_utilization": "${pod_utilization}",
+    "allocatable_pods": "${node_allocatable_pods}",
+    "total_pods": ${node_total_pods},
+    "running_pods": ${node_running_pods},
+    "pending_pods": ${node_pending_pods},
+    "failed_pods": ${node_failed_pods},
+    "succeeded_pods": ${node_succeeded_pods}
+}
+EOF
+                )
+                
+                node_details+=("${node_detail}")
+                
+                log_debug "Node ${node_name}: ${node_total_pods} pods (${node_running_pods} running), CIDR: ${node_pod_cidr}"
+            done
+        else
+            pod_errors="Failed to retrieve nodes for pod distribution"
+        fi
+    else
+        pod_errors="Failed to retrieve pods for distribution analysis"
+    fi
+    
+    # Create pod distribution result
+    local distribution_json="["
+    for i in "${!node_details[@]}"; do
+        if [[ ${i} -gt 0 ]]; then
+            distribution_json+=","
+        fi
+        distribution_json+="${node_details[${i}]}"
+    done
+    distribution_json+="]"
+    
+    local distribution_result
+    distribution_result=$(cat << EOF
+{
+    "total_pods": ${total_pods},
+    "running_pods": ${running_pods},
+    "pending_pods": ${pending_pods},
+    "failed_pods": ${failed_pods},
+    "nodes_with_pods": ${nodes_with_pods},
+    "node_details": ${distribution_json},
+    "pod_errors": "${pod_errors}",
+    "check_timestamp": "$(get_timestamp)"
+}
+EOF
+    )
+    
+    echo "${distribution_result}"
+}
+
+# Get network plugin details
+get_network_plugin_details() {
+    log_debug "Getting network plugin details..."
+    
+    local plugin_name="unknown"
+    local plugin_version="unknown"
+    local plugin_config="unknown"
+    local plugin_errors=""
+    
+    # Check for CNI configuration
+    local cni_config=""
+    if cni_config=$(execute_oc_json "get networks.config.openshift.io cluster -o json" "Get CNI config" 1 2>/dev/null); then
+        plugin_name=$(parse_json_field "${cni_config}" ".spec.networkType" "unknown" "network type")
+        
+        # Get additional plugin details based on type
+        case "${plugin_name}" in
+            "OVNKubernetes")
+                # Get OVN-Kubernetes specific details
+                local ovn_config
+                ovn_config=$(parse_json_field "${cni_config}" ".status.networkType" "unknown" "OVN config")
+                plugin_config="OVN-Kubernetes with overlay networking"
+                ;;
+            "OpenShiftSDN")
+                # Get OpenShift SDN specific details
+                plugin_config="OpenShift SDN (legacy)"
+                ;;
+            *)
+                plugin_config="Custom or third-party CNI"
+                ;;
+        esac
+    else
+        plugin_errors="Failed to retrieve CNI configuration"
+    fi
+    
+    # Try to get plugin version from cluster network operator
+    local cno_pods=""
+    if cno_pods=$(execute_oc_json "get pods -n openshift-network-operator -l name=network-operator -o json" "Get CNO pods" 1 2>/dev/null); then
+        local cno_image
+        cno_image=$(echo "${cno_pods}" | jq -r '.items[0].spec.containers[0].image' 2>/dev/null || echo "unknown")
+        
+        if [[ "${cno_image}" != "unknown" ]]; then
+            # Extract version from image tag
+            if [[ "${cno_image}" =~ :([^:]+)$ ]]; then
+                plugin_version="${BASH_REMATCH[1]}"
+            fi
+        fi
+    fi
+    
+    # Create plugin result
+    local plugin_result
+    plugin_result=$(cat << EOF
+{
+    "plugin_name": "${plugin_name}",
+    "plugin_version": "${plugin_version}",
+    "plugin_config": "${plugin_config}",
+    "plugin_errors": "${plugin_errors}",
+    "check_timestamp": "$(get_timestamp)"
+}
+EOF
+    )
+    
+    echo "${plugin_result}"
+}
+
+# Check pod network details across the cluster
+check_pod_network_details() {
+    log_info "Checking pod network details across the cluster..."
+    
+    # Reset pod network status
+    pod_network_status["overall_status"]="${STATUS_UNKNOWN}"
+    pod_network_status["overall_message"]=""
+    pod_network_status["network_type"]="unknown"
+    pod_network_status["cluster_network_cidr"]="unknown"
+    pod_network_status["service_network_cidr"]="unknown"
+    pod_network_status["host_prefix"]="unknown"
+    pod_network_status["pod_subnet_size"]="unknown"
+    pod_network_status["total_pods"]="0"
+    pod_network_status["running_pods"]="0"
+    pod_network_status["pending_pods"]="0"
+    pod_network_status["failed_pods"]="0"
+    pod_network_status["nodes_with_pods"]="0"
+    pod_network_status["total_nodes"]="0"
+    pod_network_status["network_plugin"]="unknown"
+    pod_network_status["mtu_size"]="unknown"
+    pod_network_status["check_timestamp"]="$(get_timestamp)"
+    pod_network_status["details"]=""
+    pod_network_status["errors"]=""
+    
+    local error_messages=()
+    local all_checks_successful=true
+    
+    # Get cluster network configuration
+    log_debug "Getting cluster network configuration..."
+    local network_config_result=""
+    if network_config_result=$(get_cluster_network_config); then
+        local network_type
+        local cluster_cidr
+        local service_cidr
+        local host_prefix
+        local mtu_size
+        local network_errors
+        
+        network_type=$(parse_json_field "${network_config_result}" ".network_type" "unknown" "network type")
+        cluster_cidr=$(parse_json_field "${network_config_result}" ".cluster_cidr" "unknown" "cluster CIDR")
+        service_cidr=$(parse_json_field "${network_config_result}" ".service_cidr" "unknown" "service CIDR")
+        host_prefix=$(parse_json_field "${network_config_result}" ".host_prefix" "unknown" "host prefix")
+        mtu_size=$(parse_json_field "${network_config_result}" ".mtu_size" "unknown" "MTU size")
+        network_errors=$(parse_json_field "${network_config_result}" ".network_errors" "" "network errors")
+        
+        pod_network_status["network_type"]="${network_type}"
+        pod_network_status["cluster_network_cidr"]="${cluster_cidr}"
+        pod_network_status["service_network_cidr"]="${service_cidr}"
+        pod_network_status["host_prefix"]="${host_prefix}"
+        pod_network_status["mtu_size"]="${mtu_size}"
+        
+        # Calculate pod subnet size
+        if [[ "${host_prefix}" != "unknown" && "${host_prefix}" =~ ^[0-9]+$ ]]; then
+            local subnet_size=$((2**(32-host_prefix) - 2))
+            pod_network_status["pod_subnet_size"]="${subnet_size}"
+        fi
+        
+        if [[ -n "${network_errors}" ]]; then
+            error_messages+=("Network config: ${network_errors}")
+        fi
+    else
+        error_messages+=("Failed to get cluster network configuration")
+        all_checks_successful=false
+    fi
+    
+    # Get pod distribution per node
+    log_debug "Getting pod distribution per node..."
+    local distribution_result=""
+    if distribution_result=$(get_pod_distribution_per_node); then
+        local total_pods
+        local running_pods
+        local pending_pods
+        local failed_pods
+        local nodes_with_pods
+        local pod_errors
+        
+        total_pods=$(parse_json_field "${distribution_result}" ".total_pods" "0" "total pods")
+        running_pods=$(parse_json_field "${distribution_result}" ".running_pods" "0" "running pods")
+        pending_pods=$(parse_json_field "${distribution_result}" ".pending_pods" "0" "pending pods")
+        failed_pods=$(parse_json_field "${distribution_result}" ".failed_pods" "0" "failed pods")
+        nodes_with_pods=$(parse_json_field "${distribution_result}" ".nodes_with_pods" "0" "nodes with pods")
+        pod_errors=$(parse_json_field "${distribution_result}" ".pod_errors" "" "pod errors")
+        
+        pod_network_status["total_pods"]="${total_pods}"
+        pod_network_status["running_pods"]="${running_pods}"
+        pod_network_status["pending_pods"]="${pending_pods}"
+        pod_network_status["failed_pods"]="${failed_pods}"
+        pod_network_status["nodes_with_pods"]="${nodes_with_pods}"
+        
+        if [[ -n "${pod_errors}" ]]; then
+            error_messages+=("Pod distribution: ${pod_errors}")
+        fi
+    else
+        error_messages+=("Failed to get pod distribution")
+        all_checks_successful=false
+    fi
+    
+    # Get network plugin details
+    log_debug "Getting network plugin details..."
+    local plugin_result=""
+    if plugin_result=$(get_network_plugin_details); then
+        local plugin_name
+        local plugin_version
+        local plugin_config
+        local plugin_errors
+        
+        plugin_name=$(parse_json_field "${plugin_result}" ".plugin_name" "unknown" "plugin name")
+        plugin_version=$(parse_json_field "${plugin_result}" ".plugin_version" "unknown" "plugin version")
+        plugin_config=$(parse_json_field "${plugin_result}" ".plugin_config" "unknown" "plugin config")
+        plugin_errors=$(parse_json_field "${plugin_result}" ".plugin_errors" "" "plugin errors")
+        
+        pod_network_status["network_plugin"]="${plugin_name}"
+        
+        if [[ -n "${plugin_errors}" ]]; then
+            error_messages+=("Network plugin: ${plugin_errors}")
+        fi
+    else
+        error_messages+=("Failed to get network plugin details")
+    fi
+    
+    # Get total node count from the distribution result
+    local total_nodes="unknown"
+    if [[ -n "${distribution_result}" ]]; then
+        # Extract node count from the distribution result
+        local node_details_array
+        node_details_array=$(parse_json_field "${distribution_result}" ".node_details" "[]" "node details array")
+        
+        if [[ "${node_details_array}" != "[]" && "${node_details_array}" != "null" ]]; then
+            total_nodes=$(echo "${node_details_array}" | jq 'length' 2>/dev/null || echo "unknown")
+        fi
+    fi
+    
+    # Fallback: try to get node count directly if still unknown
+    if [[ "${total_nodes}" == "unknown" ]]; then
+        if total_nodes=$(execute_oc_command "get nodes --no-headers | wc -l" "Get total node count" 1 2>/dev/null); then
+            # Remove any whitespace
+            total_nodes=$(echo "${total_nodes}" | tr -d ' \t\n\r')
+        else
+            total_nodes="unknown"
+        fi
+    fi
+    
+    pod_network_status["total_nodes"]="${total_nodes}"
+    
+    # Create detailed results
+    local details_result
+    details_result=$(cat << EOF
+{
+    "network_config": ${network_config_result:-"{}"},
+    "pod_distribution": ${distribution_result:-"{}"},
+    "plugin_details": ${plugin_result:-"{}"}
+}
+EOF
+    )
+    pod_network_status["details"]="${details_result}"
+    
+    # Combine error messages
+    if [[ ${#error_messages[@]} -gt 0 ]]; then
+        pod_network_status["errors"]=$(IFS="; "; echo "${error_messages[*]}")
+    fi
+    
+    # Determine overall status
+    local overall_status="${STATUS_UNKNOWN}"
+    local overall_message=""
+    
+    local failed_pods="${pod_network_status["failed_pods"]}"
+    local pending_pods="${pod_network_status["pending_pods"]}"
+    local total_pods="${pod_network_status["total_pods"]}"
+    local running_pods="${pod_network_status["running_pods"]}"
+    
+    if [[ ! "${all_checks_successful}" == "true" ]]; then
+        overall_status="${STATUS_CRITICAL}"
+        overall_message="Failed to complete pod network analysis"
+    elif [[ "${failed_pods}" -gt 0 ]]; then
+        overall_status="${STATUS_CRITICAL}"
+        overall_message="${failed_pods} pod(s) in failed state across ${pod_network_status["nodes_with_pods"]} nodes"
+    elif [[ "${pending_pods}" -gt 0 ]]; then
+        overall_status="${STATUS_WARNING}"
+        overall_message="${pending_pods} pod(s) in pending state, ${running_pods} running across ${pod_network_status["nodes_with_pods"]} nodes"
+    elif [[ "${total_pods}" -gt 0 ]]; then
+        overall_status="${STATUS_HEALTHY}"
+        overall_message="${total_pods} pod(s) distributed across ${pod_network_status["nodes_with_pods"]} nodes (${pod_network_status["network_type"]} networking)"
+    else
+        overall_status="${STATUS_WARNING}"
+        overall_message="No pods found in cluster"
+    fi
+    
+    # Update overall status
+    pod_network_status["overall_status"]="${overall_status}"
+    pod_network_status["overall_message"]="${overall_message}"
+    
+    # Log summary
+    log_info "Pod network details check completed:"
+    log_info "  Network type: ${pod_network_status["network_type"]}"
+    log_info "  Cluster CIDR: ${pod_network_status["cluster_network_cidr"]}"
+    log_info "  Service CIDR: ${pod_network_status["service_network_cidr"]}"
+    log_info "  Total pods: ${pod_network_status["total_pods"]}"
+    log_info "  Running pods: ${pod_network_status["running_pods"]}"
+    log_info "  Failed pods: ${pod_network_status["failed_pods"]}"
+    log_info "  Nodes with pods: ${pod_network_status["nodes_with_pods"]}/${pod_network_status["total_nodes"]}"
+    log_info "  Overall status: ${overall_status}"
+    
+    case "${overall_status}" in
+        "${STATUS_HEALTHY}")
+            log_success "${overall_message}"
+            ;;
+        "${STATUS_WARNING}")
+            log_warn "${overall_message}"
+            ;;
+        "${STATUS_CRITICAL}")
+            log_error "${overall_message}"
+            ;;
+        *)
+            log_warn "${overall_message}"
+            ;;
+    esac
+    
+    return 0
+}
+
+# Get pod network status summary
+get_pod_network_status_summary() {
+    local format="${1:-text}"
+    
+    case "${format}" in
+        "json")
+            cat << EOF
+{
+    "overall_status": "${pod_network_status["overall_status"]}",
+    "overall_message": "${pod_network_status["overall_message"]}",
+    "network_type": "${pod_network_status["network_type"]}",
+    "cluster_network_cidr": "${pod_network_status["cluster_network_cidr"]}",
+    "service_network_cidr": "${pod_network_status["service_network_cidr"]}",
+    "host_prefix": "${pod_network_status["host_prefix"]}",
+    "pod_subnet_size": "${pod_network_status["pod_subnet_size"]}",
+    "total_pods": ${pod_network_status["total_pods"]},
+    "running_pods": ${pod_network_status["running_pods"]},
+    "pending_pods": ${pod_network_status["pending_pods"]},
+    "failed_pods": ${pod_network_status["failed_pods"]},
+    "nodes_with_pods": ${pod_network_status["nodes_with_pods"]},
+    "total_nodes": ${pod_network_status["total_nodes"]},
+    "network_plugin": "${pod_network_status["network_plugin"]}",
+    "mtu_size": "${pod_network_status["mtu_size"]}",
+    "check_timestamp": "${pod_network_status["check_timestamp"]}",
+    "details": ${pod_network_status["details"]:-"{}"},
+    "errors": "${pod_network_status["errors"]}"
+}
+EOF
+            ;;
+        "text"|*)
+            cat << EOF
+Pod Network Status: ${pod_network_status["overall_status"]}
+Message: ${pod_network_status["overall_message"]}
+Network Type: ${pod_network_status["network_type"]}
+Cluster Network CIDR: ${pod_network_status["cluster_network_cidr"]}
+Service Network CIDR: ${pod_network_status["service_network_cidr"]}
+Host Prefix: ${pod_network_status["host_prefix"]}
+Pod Subnet Size: ${pod_network_status["pod_subnet_size"]} IPs per node
+Total Pods: ${pod_network_status["total_pods"]}
+Running Pods: ${pod_network_status["running_pods"]}
+Pending Pods: ${pod_network_status["pending_pods"]}
+Failed Pods: ${pod_network_status["failed_pods"]}
+Nodes with Pods: ${pod_network_status["nodes_with_pods"]}/${pod_network_status["total_nodes"]}
+Network Plugin: ${pod_network_status["network_plugin"]}
+MTU Size: ${pod_network_status["mtu_size"]}
+Check Timestamp: ${pod_network_status["check_timestamp"]}
+EOF
+            if [[ -n "${pod_network_status["errors"]}" ]]; then
+                echo "Errors: ${pod_network_status["errors"]}"
             fi
             ;;
     esac
@@ -6512,6 +10046,10 @@ generate_html_header() {
     local cluster_uuid="$5"
     local node_count="$6"
     local report_timestamp="$7"
+    local api_server_url="$8"
+    local api_server_display="$9"
+    local console_url="${10}"
+    local console_display="${11}"
     
     cat << EOF
 <!DOCTYPE html>
@@ -7148,7 +10686,13 @@ generate_html_header() {
 <body>
     <div class="container">
         <div class="header">
-            <h1>${cluster_name} - Health Report</h1>
+            <h1>${cluster_name} - Health Report 
+                <span style="font-size: 0.4em; font-weight: normal; margin-left: 20px; color: rgba(255, 255, 255, 0.9);">
+                    <strong>API:</strong> <a href="${api_server_url}" target="_blank" style="color: #66d9ef; text-decoration: none; margin-left: 5px;">${api_server_display}</a>
+                    <span style="margin: 0 10px;">|</span>
+                    <strong>Console:</strong> <a href="${console_url}" target="_blank" style="color: #66d9ef; text-decoration: none; margin-left: 5px;">${console_display}</a>
+                </span>
+            </h1>
             <div class="header-info">
                 <div class="header-info-item">
                     <h3>Cluster Name</h3>
@@ -7235,6 +10779,13 @@ generate_summary_section() {
                     Encryption: ${etcd_enabled}
                 </p>
             </a>
+            <a href="#cert-authority-section" class="summary-card ${cert_authority_status["overall_status"]}">
+                <h3>Certificate Authority</h3>
+                <p>$(generate_status_indicator "${cert_authority_status["overall_status"]}" "${cert_authority_status["overall_status"]}")</p>
+                <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                    API: $(if [[ "${cert_authority_status["api_cert_is_ca_signed"]}" == "true" ]]; then echo "CA-signed"; elif [[ "${cert_authority_status["api_cert_is_ca_signed"]}" == "false" ]]; then echo "Self-signed"; else echo "Unknown"; fi)
+                </p>
+            </a>
             <a href="#oauth-section" class="summary-card ${oauth_status["overall_status"]}">
                 <h3>OAuth Authentication</h3>
                 <p>$(generate_status_indicator "${oauth_status["overall_status"]}" "${oauth_status["overall_status"]}")</p>
@@ -7247,6 +10798,13 @@ generate_summary_section() {
                 <p>$(generate_status_indicator "${cluster_operators_status["overall_status"]}" "${cluster_operators_status["overall_status"]}")</p>
                 <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
                     ${cluster_operators_status["available_operators"]}/${cluster_operators_status["total_operators"]} available
+                </p>
+            </a>
+            <a href="#update-service-section" class="summary-card ${update_service_status["overall_status"]}">
+                <h3>Update Service</h3>
+                <p>$(generate_status_indicator "${update_service_status["overall_status"]}" "${update_service_status["overall_status"]}")</p>
+                <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                    Version: ${update_service_status["current_version"]}
                 </p>
             </a>
             <a href="#alertmanager-section" class="summary-card ${alertmanager_status["overall_status"]}">
@@ -7277,11 +10835,39 @@ generate_summary_section() {
                     $(if [[ "${backup_status["etcd_backup_enabled"]}" == "true" ]]; then echo "Configured"; else echo "Not Configured"; fi)
                 </p>
             </a>
+            <a href="#connectivity-section" class="summary-card ${connectivity_status["overall_status"]}">
+                <h3>Cluster Connectivity</h3>
+                <p>$(generate_status_indicator "${connectivity_status["overall_status"]}" "${connectivity_status["overall_status"]}")</p>
+                <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                    $(if [[ "${connectivity_status["connectivity_type"]}" == "airgapped" ]]; then echo "🔒 Airgapped"; elif [[ "${connectivity_status["connectivity_type"]}" == "connected" ]]; then echo "🌐 Connected"; else echo "❓ Unknown"; fi)
+                </p>
+            </a>
             <a href="#ingress-section" class="summary-card ${ingress_status["overall_status"]}">
                 <h3>Ingress Controller</h3>
                 <p>$(generate_status_indicator "${ingress_status["overall_status"]}" "${ingress_status["overall_status"]}")</p>
                 <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
                     ${ingress_status["ready_replicas"]}/${ingress_status["replica_count"]} replicas ready
+                </p>
+            </a>
+            <a href="#storage-section" class="summary-card ${storage_status["overall_status"]}">
+                <h3>Storage Classes</h3>
+                <p>$(generate_status_indicator "${storage_status["overall_status"]}" "${storage_status["overall_status"]}")</p>
+                <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                    ${storage_status["total_storage_classes"]} class(es), ${storage_status["csi_storage_classes"]} CSI
+                </p>
+            </a>
+            <a href="#odf-section" class="summary-card ${odf_status["overall_status"]}">
+                <h3>OpenShift Data Foundation</h3>
+                <p>$(generate_status_indicator "${odf_status["overall_status"]}" "${odf_status["overall_status"]}")</p>
+                <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                    $(if [[ "${odf_status["odf_installed"]}" == "true" ]]; then echo "${odf_status["deployment_mode"]} mode, ${odf_status["storage_nodes_count"]} nodes"; else echo "Not installed"; fi)
+                </p>
+            </a>
+            <a href="#pod-network-section" class="summary-card ${pod_network_status["overall_status"]}">
+                <h3>Pod Network Details</h3>
+                <p>$(generate_status_indicator "${pod_network_status["overall_status"]}" "${pod_network_status["overall_status"]}")</p>
+                <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                    ${pod_network_status["total_pods"]} pods, ${pod_network_status["network_type"]} networking
                 </p>
             </a>
             <a href="#node-details-section" class="summary-card ${node_details_status["overall_status"]}">
@@ -7561,6 +11147,163 @@ EOF
     echo "        </div>"
 }
 
+# Generate Certificate Authority section
+generate_cert_authority_section() {
+    cat << EOF
+        <div class="section" id="cert-authority-section">
+            <div class="section-header">
+                <h2>Certificate Authority & SSL/TLS</h2>
+                <p>Certificate authority configuration for API and Ingress endpoints</p>
+            </div>
+            <div class="section-content">
+                <div class="info-message">
+                    <strong>Overall Status:</strong> $(generate_status_indicator "${cert_authority_status["overall_status"]}" "${cert_authority_status["overall_message"]}")
+                </div>
+                
+                <h3 style="margin: 20px 0 15px 0; color: #495057;">API Server Certificate</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Property</th>
+                                <th>Value</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>Certificate Issuer</strong></td>
+                                <td>$(if [[ "${cert_authority_status["api_cert_issuer"]}" != "unknown" ]]; then echo "<span class=\"status-indicator status-neutral\">$(echo "${cert_authority_status["api_cert_issuer"]}" | cut -c1-50)...</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>Certificate authority that issued the API server certificate</td>
+                            </tr>
+                            <tr>
+                                <td><strong>CA-Signed Certificate</strong></td>
+                                <td>$(if [[ "${cert_authority_status["api_cert_is_ca_signed"]}" == "true" ]]; then echo "<span class=\"status-indicator status-healthy\">Yes</span>"; elif [[ "${cert_authority_status["api_cert_is_ca_signed"]}" == "false" ]]; then echo "<span class=\"status-indicator status-warning\">No (Self-signed)</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>Whether the certificate is signed by a trusted CA</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Certificate Expiry</strong></td>
+                                <td>$(if [[ "${cert_authority_status["api_cert_expiry"]}" != "unknown" ]]; then echo "<span class=\"status-indicator status-neutral\">${cert_authority_status["api_cert_expiry"]}</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>Certificate expiration date</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Days Until Expiry</strong></td>
+                                <td>$(if [[ "${cert_authority_status["api_cert_days_remaining"]}" =~ ^[0-9]+$ ]]; then if [[ "${cert_authority_status["api_cert_days_remaining"]}" -lt 30 ]]; then echo "<span class=\"status-indicator status-critical\">${cert_authority_status["api_cert_days_remaining"]} days</span>"; elif [[ "${cert_authority_status["api_cert_days_remaining"]}" -lt 90 ]]; then echo "<span class=\"status-indicator status-warning\">${cert_authority_status["api_cert_days_remaining"]} days</span>"; else echo "<span class=\"status-indicator status-healthy\">${cert_authority_status["api_cert_days_remaining"]} days</span>"; fi; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>Time remaining before certificate expires</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Ingress Certificate</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Property</th>
+                                <th>Value</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>Certificate Issuer</strong></td>
+                                <td>$(if [[ "${cert_authority_status["ingress_cert_issuer"]}" != "unknown" ]]; then echo "<span class=\"status-indicator status-neutral\">$(echo "${cert_authority_status["ingress_cert_issuer"]}" | cut -c1-50)...</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>Certificate authority that issued the ingress certificate</td>
+                            </tr>
+                            <tr>
+                                <td><strong>CA-Signed Certificate</strong></td>
+                                <td>$(if [[ "${cert_authority_status["ingress_cert_is_ca_signed"]}" == "true" ]]; then echo "<span class=\"status-indicator status-healthy\">Yes</span>"; elif [[ "${cert_authority_status["ingress_cert_is_ca_signed"]}" == "false" ]]; then echo "<span class=\"status-indicator status-warning\">No (Self-signed)</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>Whether the certificate is signed by a trusted CA</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Certificate Expiry</strong></td>
+                                <td>$(if [[ "${cert_authority_status["ingress_cert_expiry"]}" != "unknown" ]]; then echo "<span class=\"status-indicator status-neutral\">${cert_authority_status["ingress_cert_expiry"]}</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>Certificate expiration date</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Days Until Expiry</strong></td>
+                                <td>$(if [[ "${cert_authority_status["ingress_cert_days_remaining"]}" =~ ^[0-9]+$ ]]; then if [[ "${cert_authority_status["ingress_cert_days_remaining"]}" -lt 30 ]]; then echo "<span class=\"status-indicator status-critical\">${cert_authority_status["ingress_cert_days_remaining"]} days</span>"; elif [[ "${cert_authority_status["ingress_cert_days_remaining"]}" -lt 90 ]]; then echo "<span class=\"status-indicator status-warning\">${cert_authority_status["ingress_cert_days_remaining"]} days</span>"; else echo "<span class=\"status-indicator status-healthy\">${cert_authority_status["ingress_cert_days_remaining"]} days</span>"; fi; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>Time remaining before certificate expires</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">CA Configuration</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Configuration</th>
+                                <th>Status</th>
+                                <th>Description</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>Custom CA Bundle</strong></td>
+                                <td>$(if [[ "${cert_authority_status["custom_ca_configured"]}" == "true" ]]; then echo "<span class=\"status-indicator status-healthy\">Configured</span>"; elif [[ "${cert_authority_status["custom_ca_configured"]}" == "false" ]]; then echo "<span class=\"status-indicator status-neutral\">Not Configured</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>Additional custom CA certificates configured</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Proxy CA Bundle</strong></td>
+                                <td>$(if [[ "${cert_authority_status["proxy_ca_configured"]}" == "true" ]]; then echo "<span class=\"status-indicator status-healthy\">Configured</span>"; elif [[ "${cert_authority_status["proxy_ca_configured"]}" == "false" ]]; then echo "<span class=\"status-indicator status-neutral\">Not Configured</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>Proxy trusted CA bundle configuration</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Cluster CA Bundle</strong></td>
+                                <td>$(if [[ "${cert_authority_status["ca_bundle_configured"]}" == "true" ]]; then echo "<span class=\"status-indicator status-healthy\">Configured</span>"; elif [[ "${cert_authority_status["ca_bundle_configured"]}" == "false" ]]; then echo "<span class=\"status-indicator status-neutral\">Default</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>Cluster-wide CA bundle configuration</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+EOF
+
+    # Add recommendations
+    cat << EOF
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Recommendations</h3>
+                <div class="recommendations">
+                    <ul>
+                        <li><strong>Certificate Management:</strong> Use trusted CA-signed certificates for production environments</li>
+                        <li><strong>Certificate Rotation:</strong> Monitor certificate expiry dates and plan renewal before expiration</li>
+                        <li><strong>Custom CAs:</strong> Configure custom CA bundles for enterprise environments with internal CAs</li>
+                        <li><strong>Security:</strong> Avoid self-signed certificates in production environments</li>
+                    </ul>
+                </div>
+EOF
+
+    # Add certificate-specific recommendations
+    if [[ "${cert_authority_status["api_cert_is_ca_signed"]}" == "false" || "${cert_authority_status["ingress_cert_is_ca_signed"]}" == "false" ]]; then
+        cat << EOF
+                <div class="warning-message">
+                    <strong>Warning:</strong> Self-signed certificates detected. Consider using CA-signed certificates for production environments.
+                </div>
+EOF
+    fi
+
+    if [[ "${cert_authority_status["api_cert_days_remaining"]}" =~ ^[0-9]+$ && "${cert_authority_status["api_cert_days_remaining"]}" -lt 90 ]] || [[ "${cert_authority_status["ingress_cert_days_remaining"]}" =~ ^[0-9]+$ && "${cert_authority_status["ingress_cert_days_remaining"]}" -lt 90 ]]; then
+        cat << EOF
+                <div class="warning-message">
+                    <strong>Warning:</strong> Certificates expiring soon. Plan certificate renewal to avoid service disruption.
+                </div>
+EOF
+    fi
+
+    # Add errors if any
+    if [[ -n "${cert_authority_status["errors"]}" ]]; then
+        cat << EOF
+                <div class="error-message">
+                    <strong>Errors:</strong> ${cert_authority_status["errors"]}
+                </div>
+EOF
+    fi
+
+    echo "            </div>"
+    echo "        </div>"
+}
+
 # Generate OAuth authentication section
 generate_oauth_section() {
     cat << EOF
@@ -7827,6 +11570,147 @@ EOF
     echo "        </div>"
 }
 
+# Generate Update Service section
+generate_update_service_section() {
+    cat << EOF
+        <div class="section" id="update-service-section">
+            <div class="section-header">
+                <h2>OpenShift Update Service</h2>
+                <p>Cluster update configuration and service status</p>
+            </div>
+            <div class="section-content">
+                <div class="info-message">
+                    <strong>Overall Status:</strong> $(generate_status_indicator "${update_service_status["overall_status"]}" "${update_service_status["overall_message"]}")
+                </div>
+                
+                <h3 style="margin: 20px 0 15px 0; color: #495057;">Cluster Version Information</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Component</th>
+                                <th>Status</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>Current Version</strong></td>
+                                <td>$(if [[ "${update_service_status["current_version"]}" != "unknown" ]]; then echo "<span class=\"status-indicator status-healthy\">${update_service_status["current_version"]}</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>Currently running OpenShift version</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Update Channel</strong></td>
+                                <td>$(if [[ "${update_service_status["update_channel"]}" != "unknown" ]]; then echo "<span class=\"status-indicator status-neutral\">${update_service_status["update_channel"]}</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>Update channel subscription</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Environment Type</strong></td>
+                                <td>$(if [[ "${update_service_status["environment_type"]}" == "connected" ]]; then echo "<span class=\"status-indicator status-healthy\">Connected</span>"; elif [[ "${update_service_status["environment_type"]}" == "air_gapped" ]]; then echo "<span class=\"status-indicator status-warning\">Air-gapped</span>"; elif [[ "${update_service_status["environment_type"]}" == "proxied" ]]; then echo "<span class=\"status-indicator status-neutral\">Proxied</span>"; elif [[ "${update_service_status["environment_type"]}" == "custom_upstream" ]]; then echo "<span class=\"status-indicator status-neutral\">Custom Upstream</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>$(if [[ "${update_service_status["environment_type"]}" == "connected" ]]; then echo "Direct connection to Red Hat update servers"; elif [[ "${update_service_status["environment_type"]}" == "air_gapped" ]]; then echo "Isolated environment requiring local update service"; elif [[ "${update_service_status["environment_type"]}" == "proxied" ]]; then echo "Network access through proxy configuration"; elif [[ "${update_service_status["environment_type"]}" == "custom_upstream" ]]; then echo "Using custom update server endpoint"; else echo "Environment type not determined"; fi)</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Cluster Version Operator</strong></td>
+                                <td>$(if [[ "${update_service_status["cluster_version_operator_status"]}" == "available" ]]; then echo "<span class=\"status-indicator status-healthy\">Available</span>"; elif [[ "${update_service_status["cluster_version_operator_status"]}" == "unavailable" ]]; then echo "<span class=\"status-indicator status-critical\">Unavailable</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>Manages cluster version updates</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Updates Available</strong></td>
+                                <td>$(if [[ "${update_service_status["update_available"]}" == "true" ]]; then echo "<span class=\"status-indicator status-warning\">Yes</span>"; elif [[ "${update_service_status["update_available"]}" == "false" ]]; then echo "<span class=\"status-indicator status-healthy\">No</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>Available cluster updates</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Update Service Configuration</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Component</th>
+                                <th>Status</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>Update Service</strong></td>
+                                <td>$(if [[ "${update_service_status["update_service_configured"]}" == "true" ]]; then echo "<span class=\"status-indicator status-healthy\">Configured</span>"; elif [[ "${update_service_status["update_service_configured"]}" == "cincinnati" ]]; then echo "<span class=\"status-indicator status-healthy\">Cincinnati</span>"; elif [[ "${update_service_status["update_service_configured"]}" == "false" ]]; then echo "<span class=\"status-indicator status-warning\">Not Configured</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>$(if [[ "${update_service_status["update_service_configured"]}" == "true" ]]; then echo "OpenShift Update Service is configured"; elif [[ "${update_service_status["update_service_configured"]}" == "cincinnati" ]]; then echo "Cincinnati Update Service is running"; elif [[ "${update_service_status["update_service_configured"]}" == "false" ]]; then echo "No local update service configured"; else echo "Configuration status unknown"; fi)</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Update Service Operator</strong></td>
+                                <td>$(if [[ "${update_service_status["update_service_operator_status"]}" == "running" ]]; then echo "<span class=\"status-indicator status-healthy\">Running</span>"; elif [[ "${update_service_status["update_service_operator_status"]}" == "degraded" ]]; then echo "<span class=\"status-indicator status-warning\">Degraded</span>"; elif [[ "${update_service_status["update_service_operator_status"]}" == "not_installed" ]]; then echo "<span class=\"status-indicator status-neutral\">Not Installed</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>Manages local update service deployment</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Update Service Pods</strong></td>
+                                <td>$(if [[ "${update_service_status["update_service_pods"]}" -gt 0 ]]; then echo "<span class=\"status-indicator status-healthy\">${update_service_status["healthy_update_service_pods"]}/${update_service_status["update_service_pods"]}</span>"; else echo "<span class=\"status-indicator status-neutral\">0</span>"; fi)</td>
+                                <td>Running update service pods</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Upstream Server</strong></td>
+                                <td>$(if [[ "${update_service_status["upstream_configured"]}" == "true" ]]; then echo "<span class=\"status-indicator status-healthy\">Configured</span>"; elif [[ "${update_service_status["upstream_configured"]}" == "default" ]]; then echo "<span class=\"status-indicator status-healthy\">Default</span>"; elif [[ "${update_service_status["upstream_configured"]}" == "false" ]]; then echo "<span class=\"status-indicator status-warning\">Not Configured</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>$(if [[ "${update_service_status["update_server"]}" != "unknown" && "${update_service_status["update_server"]}" != "null" ]]; then echo "${update_service_status["update_server"]}"; elif [[ "${update_service_status["upstream_configured"]}" == "default" ]]; then echo "Using default Red Hat update servers"; else echo "No upstream server configured"; fi)</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+EOF
+
+    # Add recommendations
+    cat << EOF
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Recommendations</h3>
+                <div class="recommendations">
+                    <ul>
+                        <li><strong>Update Strategy:</strong> Ensure regular cluster updates for security and stability</li>
+                        <li><strong>Update Service:</strong> Consider deploying local update service for air-gapped environments</li>
+                        <li><strong>Channel Selection:</strong> Choose appropriate update channel (stable, fast, candidate)</li>
+                        <li><strong>Backup Before Updates:</strong> Always backup etcd and application data before major updates</li>
+                    </ul>
+                </div>
+EOF
+
+    # Add update service specific recommendations
+    if [[ "${update_service_status["update_service_configured"]}" == "false" && "${update_service_status["upstream_configured"]}" == "false" && "${update_service_status["environment_type"]}" == "air_gapped" ]]; then
+        cat << EOF
+                <div class="warning-message">
+                    <strong>Warning:</strong> Air-gapped environment without local update service. Manual updates required.
+                    <div class="code-block">Consider deploying OpenShift Update Service for automated updates</div>
+                </div>
+EOF
+    elif [[ "${update_service_status["update_service_configured"]}" == "false" && "${update_service_status["upstream_configured"]}" == "false" && "${update_service_status["environment_type"]}" != "connected" ]]; then
+        cat << EOF
+                <div class="warning-message">
+                    <strong>Warning:</strong> No update service or upstream server configured. Cluster may not receive updates automatically.
+                    <div class="code-block">oc patch clusterversion version --type merge -p '{"spec":{"upstream":"https://api.openshift.com/api/upgrades_info/v1/graph"}}'</div>
+                </div>
+EOF
+    fi
+
+    if [[ "${update_service_status["update_available"]}" == "true" ]]; then
+        cat << EOF
+                <div class="info-message">
+                    <strong>Info:</strong> Updates are available for this cluster. Review and plan update schedule.
+                    <div class="code-block">oc get clusterversion version -o yaml</div>
+                </div>
+EOF
+    fi
+
+    # Add errors if any
+    if [[ -n "${update_service_status["errors"]}" ]]; then
+        cat << EOF
+                <div class="error-message">
+                    <strong>Errors:</strong> ${update_service_status["errors"]}
+                </div>
+EOF
+    fi
+
+    echo "            </div>"
+    echo "        </div>"
+}
+
 # Generate AlertManager section
 generate_alertmanager_section() {
     cat << EOF
@@ -8046,7 +11930,7 @@ generate_loki_section() {
                             <tr>
                                 <td><strong>Collector</strong></td>
                                 <td>$(if [[ "${loki_status["collector_status"]}" == "running" ]]; then echo "<span class=\"status-indicator status-healthy\">Running</span>"; elif [[ "${loki_status["collector_status"]}" == "not_running" ]]; then echo "<span class=\"status-indicator status-warning\">Not Running</span>"; elif [[ "${loki_status["collector_status"]}" == "not_found" ]]; then echo "<span class=\"status-indicator status-critical\">Not Found</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
-                                <td>Collects and forwards logs from nodes (Fluentd/Vector)</td>
+                                <td>Collects and forwards logs from nodes$(if [[ -n "${loki_status["collector_name"]}" ]]; then echo " (DaemonSet: ${loki_status["collector_name"]})"; else echo " (Fluentd/Vector/Fluent-bit DaemonSet)"; fi)</td>
                             </tr>
                         </tbody>
                     </table>
@@ -8146,6 +12030,105 @@ EOF
     
     echo "            </div>"
     echo "        </div>"
+}
+
+# Generate cluster connectivity section
+generate_connectivity_section() {
+    cat << EOF
+        <div class="section" id="connectivity-section">
+            <div class="section-header">
+                <h2>🌐 Cluster Connectivity Status</h2>
+                <div class="section-status">
+                    $(generate_status_indicator "${connectivity_status["overall_status"]}" "${connectivity_status["overall_message"]}")
+                </div>
+            </div>
+            
+            <div class="section-content">
+                <div class="info-message">
+                    <strong>Connectivity Analysis:</strong> ${connectivity_status["overall_message"]}
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Connectivity Details</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Component</th>
+                                <th>Status</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>Connectivity Type</strong></td>
+                                <td>$(if [[ "${connectivity_status["connectivity_type"]}" == "airgapped" ]]; then echo "<span class=\"status-indicator status-warning\">🔒 Airgapped</span>"; elif [[ "${connectivity_status["connectivity_type"]}" == "connected" ]]; then echo "<span class=\"status-indicator status-healthy\">🌐 Connected</span>"; else echo "<span class=\"status-indicator status-unknown\">❓ Unknown</span>"; fi)</td>
+                                <td>$(if [[ "${connectivity_status["connectivity_type"]}" == "airgapped" ]]; then echo "Cluster uses image mirroring for disconnected operation"; elif [[ "${connectivity_status["connectivity_type"]}" == "connected" ]]; then echo "Cluster has direct access to external registries"; else echo "Unable to determine connectivity type"; fi)</td>
+                            </tr>
+                            <tr>
+                                <td><strong>ImageDigestMirrorSet</strong></td>
+                                <td>$(if [[ "${connectivity_status["imagedigestmirrorset_count"]}" -gt 0 ]]; then echo "<span class=\"status-indicator status-healthy\">${connectivity_status["imagedigestmirrorset_count"]} Found</span>"; else echo "<span class=\"status-indicator status-info\">None</span>"; fi)</td>
+                                <td>Modern image mirroring configuration (OpenShift 4.13+)</td>
+                            </tr>
+                            <tr>
+                                <td><strong>ImageContentSourcePolicy</strong></td>
+                                <td>$(if [[ "${connectivity_status["imagecontentsourcepolicy_count"]}" -gt 0 ]]; then echo "<span class=\"status-indicator status-healthy\">${connectivity_status["imagecontentsourcepolicy_count"]} Found</span>"; else echo "<span class=\"status-indicator status-info\">None</span>"; fi)</td>
+                                <td>Legacy image mirroring configuration (deprecated)</td>
+                            </tr>
+$(if [[ -n "${connectivity_status["mirror_registries"]}" ]]; then
+cat << 'MIRROR_EOF'
+                            <tr>
+                                <td><strong>Mirror Registries</strong></td>
+                                <td><span class="status-indicator status-info">Configured</span></td>
+                                <td style="word-break: break-all;">${connectivity_status["mirror_registries"]}</td>
+                            </tr>
+MIRROR_EOF
+fi)
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Connectivity Implications</h3>
+                <div class="$(if [[ "${connectivity_status["connectivity_type"]}" == "airgapped" ]]; then echo "warning-message"; else echo "info-message"; fi)">
+                    <strong>$(if [[ "${connectivity_status["connectivity_type"]}" == "airgapped" ]]; then echo "🔒 Airgapped Environment:"; else echo "🌐 Connected Environment:"; fi)</strong>
+                    <ul style="margin: 10px 0; padding-left: 20px;">
+$(if [[ "${connectivity_status["connectivity_type"]}" == "airgapped" ]]; then
+cat << 'AIRGAP_EOF'
+                        <li>✅ Enhanced security through network isolation</li>
+                        <li>⚠️ Requires manual image synchronization</li>
+                        <li>⚠️ Updates must be performed through mirrored registries</li>
+                        <li>⚠️ Limited access to external resources and operators</li>
+                        <li>📋 Ensure mirror registries are properly maintained</li>
+AIRGAP_EOF
+else
+cat << 'CONNECTED_EOF'
+                        <li>✅ Direct access to Red Hat and external registries</li>
+                        <li>✅ Automatic updates and operator installations</li>
+                        <li>✅ Access to external resources and APIs</li>
+                        <li>⚠️ Requires proper network security controls</li>
+                        <li>📋 Monitor external network dependencies</li>
+CONNECTED_EOF
+fi)
+                    </ul>
+                </div>
+                
+$(if [[ "${connectivity_status["connectivity_type"]}" == "airgapped" && -n "${connectivity_status["mirror_registries"]}" ]]; then
+cat << 'MIRROR_RECOMMENDATIONS_EOF'
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Mirror Registry Recommendations</h3>
+                <div class="recommendation info">
+                    <strong>Best Practices for Airgapped Environments:</strong>
+                    <ul style="margin: 10px 0; padding-left: 20px;">
+                        <li>🔄 Regularly sync images from upstream registries</li>
+                        <li>🔍 Monitor mirror registry health and storage capacity</li>
+                        <li>🔐 Ensure proper authentication and TLS configuration</li>
+                        <li>📊 Implement monitoring for image pull failures</li>
+                        <li>🗂️ Maintain documentation of mirrored content</li>
+                    </ul>
+                </div>
+MIRROR_RECOMMENDATIONS_EOF
+fi)
+            </div>
+        </div>
+EOF
 }
 
 # Generate cluster backup section
@@ -8452,6 +12435,791 @@ EOF
             </div>
         </div>
 EOF
+}
+
+# Generate storage classes section
+generate_storage_section() {
+    cat << EOF
+        <div class="section" id="storage-section">
+            <div class="section-header">
+                <h2>Storage Classes & CSI Drivers</h2>
+                <p>Storage classes, CSI drivers, and backend storage analysis</p>
+            </div>
+            <div class="section-content">
+                <div class="info-message">
+                    <strong>Overall Status:</strong> $(generate_status_indicator "${storage_status["overall_status"]}" "${storage_status["overall_message"]}")
+                </div>
+                
+                <h3 style="margin: 20px 0 15px 0; color: #495057;">Storage Summary</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Metric</th>
+                                <th>Value</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Total Storage Classes</td>
+                                <td>${storage_status["total_storage_classes"]}</td>
+                            </tr>
+                            <tr>
+                                <td>Default Storage Class</td>
+                                <td>$(if [[ "${storage_status["default_storage_class"]}" == "none" ]]; then echo "<span class=\"status-indicator status-warning\">None Configured</span>"; elif [[ "${storage_status["default_storage_class"]}" == "unknown" ]]; then echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; else echo "<span class=\"status-indicator status-healthy\">${storage_status["default_storage_class"]}</span>"; fi)</td>
+                            </tr>
+                            <tr>
+                                <td>CSI Storage Classes</td>
+                                <td>$(if [[ "${storage_status["csi_storage_classes"]}" -gt 0 ]]; then echo "<span class=\"status-indicator status-healthy\">${storage_status["csi_storage_classes"]}</span>"; else echo "<span class=\"status-indicator status-warning\">0</span>"; fi)</td>
+                            </tr>
+                            <tr>
+                                <td>Non-CSI Storage Classes</td>
+                                <td>${storage_status["non_csi_storage_classes"]}</td>
+                            </tr>
+                            <tr>
+                                <td>Volume Expansion Enabled</td>
+                                <td>$(if [[ "${storage_status["allow_volume_expansion"]}" -gt 0 ]]; then echo "<span class=\"status-indicator status-healthy\">${storage_status["allow_volume_expansion"]} class(es)</span>"; else echo "<span class=\"status-indicator status-warning\">None</span>"; fi)</td>
+                            </tr>
+                            <tr>
+                                <td>Backend Storage Types</td>
+                                <td>${storage_status["backend_storage_types"]}</td>
+                            </tr>
+                            <tr>
+                                <td>Volume Binding Modes</td>
+                                <td>${storage_status["volume_binding_modes"]}</td>
+                            </tr>
+                            <tr>
+                                <td>Reclaim Policies</td>
+                                <td>${storage_status["reclaim_policies"]}</td>
+                            </tr>
+                            <tr>
+                                <td>Check Timestamp</td>
+                                <td>${storage_status["check_timestamp"]}</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Detailed Storage Class Information</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Storage Class</th>
+                                <th>Backend Storage</th>
+                                <th>Provisioner</th>
+                                <th>Performance Tier</th>
+                                <th>Default</th>
+                                <th>CSI</th>
+                                <th>Expansion</th>
+                                <th>Reclaim Policy</th>
+                                <th>Binding Mode</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+EOF
+    
+    # Parse and display individual storage class details
+    if [[ -n "${storage_status["details"]}" && "${storage_status["details"]}" != "[]" && "${storage_status["details"]}" != "null" ]]; then
+        # Create a temporary file to store the storage class details
+        local temp_storage_file
+        temp_storage_file=$(create_temp_file "storage" ".json")
+        echo "${storage_status["details"]}" > "${temp_storage_file}"
+        
+        # Check if jq is available and the JSON is valid
+        if command -v jq >/dev/null 2>&1 && jq empty < "${temp_storage_file}" 2>/dev/null; then
+            # Count the number of storage classes
+            local sc_count
+            sc_count=$(jq '. | length' < "${temp_storage_file}" 2>/dev/null || echo "0")
+            
+            if [[ "${sc_count}" -gt 0 ]]; then
+                # Use jq to extract all storage classes at once and format them
+                jq -r '.[] | 
+                    "<tr>" +
+                    "<td><strong>" + .name + "</strong></td>" +
+                    "<td>" + .backend_storage + "</td>" +
+                    "<td>" + (.provisioner | if length > 30 then .[0:27] + "..." else . end) + "</td>" +
+                    "<td>" + .performance_tier + "</td>" +
+                    "<td>" + (if .is_default == true then "<span class=\"status-indicator status-healthy\">Yes</span>" else "<span class=\"status-indicator status-neutral\">No</span>" end) + "</td>" +
+                    "<td>" + (if .is_csi == true then "<span class=\"status-indicator status-healthy\">Yes</span>" else "<span class=\"status-indicator status-warning\">No</span>" end) + "</td>" +
+                    "<td>" + (if .allow_volume_expansion == true then "<span class=\"status-indicator status-healthy\">Yes</span>" else "<span class=\"status-indicator status-neutral\">No</span>" end) + "</td>" +
+                    "<td>" + .reclaim_policy + "</td>" +
+                    "<td>" + .volume_binding_mode + "</td>" +
+                    "</tr>"' < "${temp_storage_file}" 2>/dev/null || {
+                    cat << EOF
+                            <tr>
+                                <td colspan="9" style="text-align: center; color: #6c757d;">Error parsing storage class details (${sc_count} classes found)</td>
+                            </tr>
+EOF
+                }
+            else
+                cat << EOF
+                            <tr>
+                                <td colspan="9" style="text-align: center; color: #6c757d;">No storage class details available (count: ${sc_count})</td>
+                            </tr>
+EOF
+            fi
+        else
+            cat << EOF
+                            <tr>
+                                <td colspan="9" style="text-align: center; color: #6c757d;">Unable to parse storage class details (jq not available or invalid JSON)</td>
+                            </tr>
+EOF
+        fi
+        
+        # Clean up temporary file
+        rm -f "${temp_storage_file}" 2>/dev/null
+    else
+        cat << EOF
+                            <tr>
+                                <td colspan="9" style="text-align: center; color: #6c757d;">No storage class details available</td>
+                            </tr>
+EOF
+    fi
+    
+    cat << EOF
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Performance & IOPS Information</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Storage Class</th>
+                                <th>Backend Storage</th>
+                                <th>Performance Tier</th>
+                                <th>IOPS Information</th>
+                                <th>Throughput Information</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+EOF
+    
+    # Parse and display performance information
+    if [[ -n "${storage_status["details"]}" && "${storage_status["details"]}" != "[]" && "${storage_status["details"]}" != "null" ]]; then
+        # Create a temporary file to store the storage class details
+        local temp_perf_file
+        temp_perf_file=$(create_temp_file "storage-perf" ".json")
+        echo "${storage_status["details"]}" > "${temp_perf_file}"
+        
+        # Check if jq is available and the JSON is valid
+        if command -v jq >/dev/null 2>&1 && jq empty < "${temp_perf_file}" 2>/dev/null; then
+            # Count the number of storage classes
+            local sc_count
+            sc_count=$(jq '. | length' < "${temp_perf_file}" 2>/dev/null || echo "0")
+            
+            if [[ "${sc_count}" -gt 0 ]]; then
+                # Use jq to extract all storage classes at once and format them
+                jq -r '.[] | 
+                    "<tr>" +
+                    "<td><strong>" + .name + "</strong></td>" +
+                    "<td>" + .backend_storage + "</td>" +
+                    "<td>" + .performance_tier + "</td>" +
+                    "<td>" + (if .iops_info != "" then .iops_info else "Not specified" end) + "</td>" +
+                    "<td>" + (if .throughput_info != "" then .throughput_info else "Not specified" end) + "</td>" +
+                    "</tr>"' < "${temp_perf_file}" 2>/dev/null || {
+                    cat << EOF
+                            <tr>
+                                <td colspan="5" style="text-align: center; color: #6c757d;">Error parsing performance details</td>
+                            </tr>
+EOF
+                }
+            else
+                cat << EOF
+                            <tr>
+                                <td colspan="5" style="text-align: center; color: #6c757d;">No performance details available</td>
+                            </tr>
+EOF
+            fi
+        else
+            cat << EOF
+                            <tr>
+                                <td colspan="5" style="text-align: center; color: #6c757d;">Unable to parse performance details</td>
+                            </tr>
+EOF
+        fi
+        
+        # Clean up temporary file
+        rm -f "${temp_perf_file}" 2>/dev/null
+    else
+        cat << EOF
+                            <tr>
+                                <td colspan="5" style="text-align: center; color: #6c757d;">No performance details available</td>
+                            </tr>
+EOF
+    fi
+    
+    cat << EOF
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Storage Recommendations</h3>
+                <div class="info-message">
+                    <strong>Best Practices:</strong>
+                    <ul style="margin: 10px 0; padding-left: 20px;">
+                        <li><strong>Default Storage Class:</strong> Configure a default storage class for automatic PVC provisioning</li>
+                        <li><strong>CSI Drivers:</strong> Use CSI drivers for better features and future compatibility</li>
+                        <li><strong>Volume Expansion:</strong> Enable volume expansion for storage classes that support it</li>
+                        <li><strong>Performance Tiers:</strong> Choose appropriate storage types based on workload requirements</li>
+                        <li><strong>Reclaim Policy:</strong> Use 'Retain' for important data, 'Delete' for temporary storage</li>
+                        <li><strong>Binding Mode:</strong> Use 'WaitForFirstConsumer' for topology-aware provisioning</li>
+                    </ul>
+                </div>
+EOF
+    
+    # Add storage-specific recommendations
+    if [[ "${storage_status["default_storage_class"]}" == "none" ]]; then
+        cat << EOF
+                <div class="error-message">
+                    <strong>Critical:</strong> No default storage class configured. Set a default storage class:
+                    <div class="code-block">oc patch storageclass &lt;storage-class-name&gt; -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'</div>
+                </div>
+EOF
+    fi
+    
+    if [[ "${storage_status["csi_storage_classes"]}" -eq 0 && "${storage_status["total_storage_classes"]}" -gt 0 ]]; then
+        cat << EOF
+                <div class="warning-message">
+                    <strong>Warning:</strong> No CSI storage classes detected. Consider migrating to CSI drivers for better features and support.
+                </div>
+EOF
+    fi
+    
+    if [[ "${storage_status["allow_volume_expansion"]}" -eq 0 && "${storage_status["total_storage_classes"]}" -gt 0 ]]; then
+        cat << EOF
+                <div class="warning-message">
+                    <strong>Warning:</strong> No storage classes have volume expansion enabled. Consider enabling this feature for operational flexibility.
+                </div>
+EOF
+    fi
+    
+    # Add errors if any
+    if [[ -n "${storage_status["errors"]}" ]]; then
+        cat << EOF
+                <div class="error-message">
+                    <strong>Errors:</strong> ${storage_status["errors"]}
+                </div>
+EOF
+    fi
+    
+    echo "            </div>"
+    echo "        </div>"
+}
+
+# Generate ODF section
+generate_odf_section() {
+    cat << EOF
+        <div class="section" id="odf-section">
+            <div class="section-header">
+                <h2>OpenShift Data Foundation (ODF)</h2>
+                <p>ODF installation status, deployment mode, and storage cluster health</p>
+            </div>
+            <div class="section-content">
+                <div class="info-message">
+                    <strong>Overall Status:</strong> $(generate_status_indicator "${odf_status["overall_status"]}" "${odf_status["overall_message"]}")
+                </div>
+                
+                <h3 style="margin: 20px 0 15px 0; color: #495057;">ODF Installation & Configuration</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Component</th>
+                                <th>Status</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>ODF Installation</strong></td>
+                                <td>$(if [[ "${odf_status["odf_installed"]}" == "true" ]]; then echo "<span class=\"status-indicator status-healthy\">Installed</span>"; elif [[ "${odf_status["odf_installed"]}" == "false" ]]; then echo "<span class=\"status-indicator status-warning\">Not Installed</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>Version: ${odf_status["odf_version"]}</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Deployment Mode</strong></td>
+                                <td>$(if [[ "${odf_status["deployment_mode"]}" == "internal" ]]; then echo "<span class=\"status-indicator status-healthy\">Internal</span>"; elif [[ "${odf_status["deployment_mode"]}" == "external" ]]; then echo "<span class=\"status-indicator status-healthy\">External</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>$(if [[ "${odf_status["deployment_mode"]}" == "internal" ]]; then echo "Uses cluster nodes for storage"; elif [[ "${odf_status["deployment_mode"]}" == "external" ]]; then echo "Uses external storage systems"; else echo "Mode not determined"; fi)</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Storage Cluster</strong></td>
+                                <td>$(if [[ "${odf_status["storage_cluster_status"]}" == "Ready" ]]; then echo "<span class=\"status-indicator status-healthy\">Ready</span>"; elif [[ "${odf_status["storage_cluster_status"]}" == "unknown" ]]; then echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; else echo "<span class=\"status-indicator status-warning\">${odf_status["storage_cluster_status"]}</span>"; fi)</td>
+                                <td>Name: ${odf_status["storage_cluster_name"]}</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Storage Nodes</strong></td>
+                                <td>$(if [[ "${odf_status["storage_nodes_count"]}" == "external" ]]; then echo "<span class=\"status-indicator status-healthy\">External</span>"; elif [[ "${odf_status["storage_nodes_count"]}" -gt 0 ]] 2>/dev/null; then echo "<span class=\"status-indicator status-healthy\">${odf_status["storage_nodes_count"]} Nodes</span>"; else echo "<span class=\"status-indicator status-warning\">0 Nodes</span>"; fi)</td>
+                                <td>$(if [[ "${odf_status["deployment_mode"]}" == "external" ]]; then echo "External storage cluster nodes"; else echo "Dedicated storage nodes in the cluster"; fi)</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Ceph Storage Health</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Component</th>
+                                <th>Status</th>
+                                <th>Description</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>Ceph Cluster Health</strong></td>
+                                <td>$(if [[ "${odf_status["ceph_cluster_health"]}" == "HEALTH_OK" ]]; then echo "<span class=\"status-indicator status-healthy\">HEALTH_OK</span>"; elif [[ "${odf_status["ceph_cluster_health"]}" == "HEALTH_WARN" ]]; then echo "<span class=\"status-indicator status-warning\">HEALTH_WARN</span>"; elif [[ "${odf_status["ceph_cluster_health"]}" == "HEALTH_ERR" ]]; then echo "<span class=\"status-indicator status-critical\">HEALTH_ERR</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>Overall Ceph cluster health status</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Total Storage Capacity</strong></td>
+                                <td>$(if [[ "${odf_status["storage_capacity_total"]}" != "unknown" ]]; then echo "<span class=\"status-indicator status-healthy\">${odf_status["storage_capacity_total"]}</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>Total available storage capacity</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Persistent Volumes</strong></td>
+                                <td>$(if [[ "${odf_status["pv_count"]}" -gt 0 ]]; then echo "<span class=\"status-indicator status-healthy\">${odf_status["pv_count"]} PVs</span>"; else echo "<span class=\"status-indicator status-neutral\">0 PVs</span>"; fi)</td>
+                                <td>ODF-provisioned persistent volumes</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Persistent Volume Claims</strong></td>
+                                <td>$(if [[ "${odf_status["pvc_count"]}" -gt 0 ]]; then echo "<span class=\"status-indicator status-healthy\">${odf_status["pvc_count"]} PVCs</span>"; else echo "<span class=\"status-indicator status-neutral\">0 PVCs</span>"; fi)</td>
+                                <td>Active storage requests using ODF</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Object Storage (NooBaa/MCG)</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Component</th>
+                                <th>Status</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>NooBaa System</strong></td>
+                                <td>$(if [[ "${odf_status["noobaa_status"]}" == "Ready" ]]; then echo "<span class=\"status-indicator status-healthy\">Ready</span>"; elif [[ "${odf_status["noobaa_status"]}" == "not_found" ]]; then echo "<span class=\"status-indicator status-warning\">Not Found</span>"; elif [[ "${odf_status["noobaa_status"]}" == "unknown" ]]; then echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; else echo "<span class=\"status-indicator status-warning\">${odf_status["noobaa_status"]}</span>"; fi)</td>
+                                <td>S3-compatible object storage system</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Multi-Cloud Gateway (MCG)</strong></td>
+                                <td>$(if [[ "${odf_status["mcg_status"]}" == "running" ]]; then echo "<span class=\"status-indicator status-healthy\">Running</span>"; elif [[ "${odf_status["mcg_status"]}" == "partial" ]]; then echo "<span class=\"status-indicator status-warning\">Partial</span>"; elif [[ "${odf_status["mcg_status"]}" == "not_running" ]]; then echo "<span class=\"status-indicator status-critical\">Not Running</span>"; elif [[ "${odf_status["mcg_status"]}" == "integrated" ]]; then echo "<span class=\"status-indicator status-healthy\">Integrated</span>"; elif [[ "${odf_status["mcg_status"]}" == "operator_only" ]]; then echo "<span class=\"status-indicator status-warning\">Operator Only</span>"; elif [[ "${odf_status["mcg_status"]}" == "service_available" ]]; then echo "<span class=\"status-indicator status-healthy\">Service Available</span>"; elif [[ "${odf_status["mcg_status"]}" == "storage_class_available" ]]; then echo "<span class=\"status-indicator status-healthy\">Storage Class Available</span>"; elif [[ "${odf_status["mcg_status"]}" == "not_found" ]]; then echo "<span class=\"status-indicator status-warning\">Not Found</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>$(if [[ -n "${odf_status["mcg_pod_details"]}" ]]; then echo "${odf_status["mcg_pod_details"]}"; else echo "Multi-cloud object storage gateway"; fi)</td>
+                            </tr>
+                            <tr>
+                                <td><strong>S3 Endpoint</strong></td>
+                                <td>$(if [[ "${odf_status["s3_endpoint"]}" != "unknown" && "${odf_status["s3_endpoint"]}" != "null" ]]; then echo "<span class=\"status-indicator status-healthy\">Available</span>"; else echo "<span class=\"status-indicator status-warning\">Not Available</span>"; fi)</td>
+                                <td>$(if [[ "${odf_status["s3_endpoint"]}" != "unknown" && "${odf_status["s3_endpoint"]}" != "null" ]]; then echo "${odf_status["s3_endpoint"]}"; else echo "S3 endpoint not configured"; fi)</td>
+                            </tr>
+                            <tr>
+                                <td><strong>MCG Version</strong></td>
+                                <td>$(if [[ "${odf_status["mcg_version"]}" != "unknown" ]]; then echo "<span class=\"status-indicator status-neutral\">${odf_status["mcg_version"]}</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>NooBaa/MCG container image version</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Object Storage Usage</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Resource Type</th>
+                                <th>Count</th>
+                                <th>Description</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>Object Bucket Claims (OBCs)</strong></td>
+                                <td>$(if [[ "${odf_status["object_bucket_claims_count"]}" -gt 0 ]]; then echo "<span class=\"status-indicator status-healthy\">${odf_status["object_bucket_claims_count"]}</span>"; else echo "<span class=\"status-indicator status-neutral\">0</span>"; fi)</td>
+                                <td>Active object storage bucket requests</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Bucket Claims (Legacy)</strong></td>
+                                <td>$(if [[ "${odf_status["bucket_claims_count"]}" -gt 0 ]]; then echo "<span class=\"status-indicator status-warning\">${odf_status["bucket_claims_count"]}</span>"; else echo "<span class=\"status-indicator status-neutral\">0</span>"; fi)</td>
+                                <td>Legacy bucket claim resources</td>
+                            </tr>
+                            <tr>
+                                <td><strong>NooBaa Accounts</strong></td>
+                                <td>$(if [[ "${odf_status["noobaa_accounts_count"]}" -gt 0 ]]; then echo "<span class=\"status-indicator status-healthy\">${odf_status["noobaa_accounts_count"]}</span>"; else echo "<span class=\"status-indicator status-neutral\">0</span>"; fi)</td>
+                                <td>NooBaa user accounts for S3 access</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">ODF Deployment Modes</h3>
+                <div class="info-message">
+                    <strong>Deployment Mode Information:</strong>
+                    <ul style="margin: 10px 0; padding-left: 20px;">
+                        <li><strong>Internal Mode:</strong> ODF uses local storage devices from OpenShift worker nodes</li>
+                        <li><strong>External Mode:</strong> ODF connects to external Ceph clusters or storage systems</li>
+                    </ul>
+                </div>
+                
+$(if [[ "${odf_status["odf_installed"]}" == "false" ]]; then
+cat << 'ODF_INSTALL_EOF'
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Installation Recommendations</h3>
+                <div class="warning-message">
+                    <strong>ODF Not Installed:</strong> Consider installing OpenShift Data Foundation for:
+                    <ul style="margin: 10px 0; padding-left: 20px;">
+                        <li>🗄️ <strong>Block Storage:</strong> High-performance RBD volumes for databases and applications</li>
+                        <li>📁 <strong>File Storage:</strong> Shared CephFS volumes for multi-pod access</li>
+                        <li>🪣 <strong>Object Storage:</strong> S3-compatible storage via NooBaa/MCG</li>
+                        <li>🔄 <strong>Multi-Cloud:</strong> Unified storage across cloud providers</li>
+                        <li>📊 <strong>Data Services:</strong> Built-in backup, disaster recovery, and data protection</li>
+                    </ul>
+                    
+                    <p><strong>Installation Options:</strong></p>
+                    <ul style="margin: 10px 0; padding-left: 20px;">
+                        <li><strong>Internal Mode:</strong> Use local disks from worker nodes (recommended for new clusters)</li>
+                        <li><strong>External Mode:</strong> Connect to existing Ceph clusters</li>
+                    </ul>
+                </div>
+ODF_INSTALL_EOF
+elif [[ "${odf_status["deployment_mode"]}" == "internal" ]]; then
+cat << 'ODF_INTERNAL_EOF'
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Internal Mode Configuration</h3>
+                <div class="info-message">
+                    <strong>Internal Deployment Benefits:</strong>
+                    <ul style="margin: 10px 0; padding-left: 20px;">
+                        <li>✅ Simplified management and deployment</li>
+                        <li>✅ Integrated with OpenShift lifecycle</li>
+                        <li>✅ Automatic storage provisioning</li>
+                        <li>✅ Built-in high availability and replication</li>
+                        <li>⚠️ Requires dedicated storage nodes with local disks</li>
+                        <li>⚠️ Storage capacity limited by cluster nodes</li>
+                    </ul>
+                </div>
+ODF_INTERNAL_EOF
+elif [[ "${odf_status["deployment_mode"]}" == "external" ]]; then
+cat << 'ODF_EXTERNAL_EOF'
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">External Mode Configuration</h3>
+                <div class="info-message">
+                    <strong>External Deployment Benefits:</strong>
+                    <ul style="margin: 10px 0; padding-left: 20px;">
+                        <li>✅ Leverage existing Ceph infrastructure</li>
+                        <li>✅ Separate storage and compute scaling</li>
+                        <li>✅ Higher storage capacity potential</li>
+                        <li>✅ Shared storage across multiple clusters</li>
+                        <li>⚠️ Requires external Ceph cluster management</li>
+                        <li>⚠️ Network connectivity dependencies</li>
+                    </ul>
+                </div>
+ODF_EXTERNAL_EOF
+fi)
+                
+                <div class="info-message">
+                    <strong>ODF Storage Classes:</strong> When ODF is installed, it typically provides these storage classes:
+                    <ul style="margin: 10px 0; padding-left: 20px;">
+                        <li><code>ocs-storagecluster-ceph-rbd</code> - Block storage (RWO)</li>
+                        <li><code>ocs-storagecluster-cephfs</code> - File storage (RWX)</li>
+                        <li><code>ocs-storagecluster-ceph-rgw</code> - Object storage via Ceph RGW (OBC)</li>
+                        <li><code>openshift-storage.noobaa.io</code> - Object storage via NooBaa/MCG (OBC)</li>
+                    </ul>
+                </div>
+                
+EOF
+    
+    # Add errors if any
+    if [[ -n "${odf_status["errors"]}" ]]; then
+        cat << EOF
+                <div class="error-message">
+                    <strong>Errors:</strong> ${odf_status["errors"]}
+                </div>
+EOF
+    fi
+    
+    echo "            </div>"
+    echo "        </div>"
+}
+
+# Generate pod network section
+generate_pod_network_section() {
+    cat << EOF
+        <div class="section" id="pod-network-section">
+            <div class="section-header">
+                <h2>Pod Network Details</h2>
+                <p>Pod distribution, network configuration, and CIDR allocation per node</p>
+            </div>
+            <div class="section-content">
+                <div class="info-message">
+                    <strong>Overall Status:</strong> $(generate_status_indicator "${pod_network_status["overall_status"]}" "${pod_network_status["overall_message"]}")
+                </div>
+                
+                <h3 style="margin: 20px 0 15px 0; color: #495057;">Cluster Network Configuration</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Network Parameter</th>
+                                <th>Value</th>
+                                <th>Description</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>Network Type</strong></td>
+                                <td>$(if [[ "${pod_network_status["network_type"]}" == "OVNKubernetes" ]]; then echo "<span class=\"status-indicator status-healthy\">OVN-Kubernetes</span>"; elif [[ "${pod_network_status["network_type"]}" == "OpenShiftSDN" ]]; then echo "<span class=\"status-indicator status-warning\">OpenShift SDN (Legacy)</span>"; else echo "<span class=\"status-indicator status-unknown\">${pod_network_status["network_type"]}</span>"; fi)</td>
+                                <td>Container Network Interface (CNI) plugin</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Cluster Network CIDR</strong></td>
+                                <td><code>${pod_network_status["cluster_network_cidr"]}</code></td>
+                                <td>IP range for pod networking</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Service Network CIDR</strong></td>
+                                <td><code>${pod_network_status["service_network_cidr"]}</code></td>
+                                <td>IP range for Kubernetes services</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Host Prefix</strong></td>
+                                <td><code>/${pod_network_status["host_prefix"]}</code></td>
+                                <td>Subnet size allocated to each node</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Pod Subnet Size</strong></td>
+                                <td>$(if [[ "${pod_network_status["pod_subnet_size"]}" != "unknown" ]]; then echo "<span class=\"status-indicator status-healthy\">${pod_network_status["pod_subnet_size"]} IPs</span>"; else echo "<span class=\"status-indicator status-unknown\">Unknown</span>"; fi)</td>
+                                <td>Available IP addresses per node</td>
+                            </tr>
+                            <tr>
+                                <td><strong>MTU Size</strong></td>
+                                <td>$(if [[ "${pod_network_status["mtu_size"]}" != "unknown" ]]; then echo "${pod_network_status["mtu_size"]} bytes"; else echo "Default"; fi)</td>
+                                <td>Maximum Transmission Unit for network packets</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Pod Distribution Summary</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Pod Status</th>
+                                <th>Count</th>
+                                <th>Percentage</th>
+                                <th>Description</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>Total Pods</strong></td>
+                                <td>${pod_network_status["total_pods"]}</td>
+                                <td>100%</td>
+                                <td>All pods across the cluster</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Running Pods</strong></td>
+                                <td>$(if [[ "${pod_network_status["running_pods"]}" -gt 0 ]]; then echo "<span class=\"status-indicator status-healthy\">${pod_network_status["running_pods"]}</span>"; else echo "<span class=\"status-indicator status-warning\">0</span>"; fi)</td>
+                                <td>$(if [[ "${pod_network_status["total_pods"]}" -gt 0 ]]; then awk "BEGIN {printf \"%.1f%%\", ${pod_network_status["running_pods"]} * 100 / ${pod_network_status["total_pods"]}}"; else echo "0%"; fi)</td>
+                                <td>Pods in running state</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Pending Pods</strong></td>
+                                <td>$(if [[ "${pod_network_status["pending_pods"]}" -gt 0 ]]; then echo "<span class=\"status-indicator status-warning\">${pod_network_status["pending_pods"]}</span>"; else echo "<span class=\"status-indicator status-healthy\">0</span>"; fi)</td>
+                                <td>$(if [[ "${pod_network_status["total_pods"]}" -gt 0 ]]; then awk "BEGIN {printf \"%.1f%%\", ${pod_network_status["pending_pods"]} * 100 / ${pod_network_status["total_pods"]}}"; else echo "0%"; fi)</td>
+                                <td>Pods waiting to be scheduled</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Failed Pods</strong></td>
+                                <td>$(if [[ "${pod_network_status["failed_pods"]}" -gt 0 ]]; then echo "<span class=\"status-indicator status-critical\">${pod_network_status["failed_pods"]}</span>"; else echo "<span class=\"status-indicator status-healthy\">0</span>"; fi)</td>
+                                <td>$(if [[ "${pod_network_status["total_pods"]}" -gt 0 ]]; then awk "BEGIN {printf \"%.1f%%\", ${pod_network_status["failed_pods"]} * 100 / ${pod_network_status["total_pods"]}}"; else echo "0%"; fi)</td>
+                                <td>Pods in failed state</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Nodes with Pods</strong></td>
+                                <td>${pod_network_status["nodes_with_pods"]} / ${pod_network_status["total_nodes"]}</td>
+                                <td>$(if [[ "${pod_network_status["total_nodes"]}" -gt 0 ]]; then awk "BEGIN {printf \"%.1f%%\", ${pod_network_status["nodes_with_pods"]} * 100 / ${pod_network_status["total_nodes"]}}"; else echo "0%"; fi)</td>
+                                <td>Nodes currently hosting pods</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Per-Node Pod Network Details</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Node Name</th>
+                                <th>Internal IP</th>
+                                <th>Pod CIDR</th>
+                                <th>CIDR Utilization</th>
+                                <th>Total Pods</th>
+                                <th>Running</th>
+                                <th>Pending</th>
+                                <th>Failed</th>
+                                <th>Max Pods</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+EOF
+    
+    # Parse and display per-node pod network details
+    if [[ -n "${pod_network_status["details"]}" && "${pod_network_status["details"]}" != "{}" ]]; then
+        # Extract node details from the pod distribution data
+        local pod_distribution_data
+        pod_distribution_data=$(echo "${pod_network_status["details"]}" | jq -r '.pod_distribution.node_details' 2>/dev/null || echo "[]")
+        
+        if [[ -n "${pod_distribution_data}" && "${pod_distribution_data}" != "[]" && "${pod_distribution_data}" != "null" ]]; then
+            # Create a temporary file to store the node details
+            local temp_pod_network_file
+            temp_pod_network_file=$(create_temp_file "pod-network" ".json")
+            echo "${pod_distribution_data}" > "${temp_pod_network_file}"
+            
+            # Check if jq is available and the JSON is valid
+            if command -v jq >/dev/null 2>&1 && jq empty < "${temp_pod_network_file}" 2>/dev/null; then
+                # Count the number of nodes
+                local node_count
+                node_count=$(jq '. | length' < "${temp_pod_network_file}" 2>/dev/null || echo "0")
+                
+                if [[ "${node_count}" -gt 0 ]]; then
+                    # Use jq to extract all nodes at once and format them
+                    jq -r '.[] | 
+                        "<tr>" +
+                        "<td><strong>" + .node_name + "</strong></td>" +
+                        "<td>" + .internal_ip + "</td>" +
+                        "<td><code>" + .pod_cidr + "</code></td>" +
+                        "<td>" + (if .pod_utilization != "unknown" then .pod_utilization else "N/A" end) + "</td>" +
+                        "<td>" + (.total_pods | tostring) + "</td>" +
+                        "<td>" + (if .running_pods > 0 then "<span class=\"status-indicator status-healthy\">" + (.running_pods | tostring) + "</span>" else "0" end) + "</td>" +
+                        "<td>" + (if .pending_pods > 0 then "<span class=\"status-indicator status-warning\">" + (.pending_pods | tostring) + "</span>" else "0" end) + "</td>" +
+                        "<td>" + (if .failed_pods > 0 then "<span class=\"status-indicator status-critical\">" + (.failed_pods | tostring) + "</span>" else "0" end) + "</td>" +
+                        "<td>" + .allocatable_pods + "</td>" +
+                        "</tr>"' < "${temp_pod_network_file}" 2>/dev/null || {
+                        cat << EOF
+                            <tr>
+                                <td colspan="9" style="text-align: center; color: #6c757d;">Error parsing pod network details (${node_count} nodes found)</td>
+                            </tr>
+EOF
+                    }
+                else
+                    cat << EOF
+                            <tr>
+                                <td colspan="9" style="text-align: center; color: #6c757d;">No pod network details available (count: ${node_count})</td>
+                            </tr>
+EOF
+                fi
+            else
+                cat << EOF
+                            <tr>
+                                <td colspan="9" style="text-align: center; color: #6c757d;">Unable to parse pod network details (jq not available or invalid JSON)</td>
+                            </tr>
+EOF
+            fi
+            
+            # Clean up temporary file
+            rm -f "${temp_pod_network_file}" 2>/dev/null
+        else
+            cat << EOF
+                            <tr>
+                                <td colspan="9" style="text-align: center; color: #6c757d;">No per-node pod network details available</td>
+                            </tr>
+EOF
+        fi
+    else
+        cat << EOF
+                            <tr>
+                                <td colspan="9" style="text-align: center; color: #6c757d;">Pod network details not available</td>
+                            </tr>
+EOF
+    fi
+    
+    cat << EOF
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Network Configuration Insights</h3>
+                <div class="info-message">
+                    <strong>Network Type Analysis:</strong>
+                    $(if [[ "${pod_network_status["network_type"]}" == "OVNKubernetes" ]]; then
+                        echo "<ul style=\"margin: 10px 0; padding-left: 20px;\">"
+                        echo "<li>✅ <strong>OVN-Kubernetes:</strong> Modern, feature-rich CNI with advanced networking capabilities</li>"
+                        echo "<li>🔒 <strong>Security:</strong> Built-in network policies and micro-segmentation</li>"
+                        echo "<li>🌐 <strong>Multi-tenancy:</strong> Better isolation between namespaces and pods</li>"
+                        echo "<li>📊 <strong>Performance:</strong> Optimized for large-scale deployments</li>"
+                        echo "<li>🔧 <strong>Features:</strong> Support for IPSec, egress IP, and hybrid networking</li>"
+                        echo "</ul>"
+                    elif [[ "${pod_network_status["network_type"]}" == "OpenShiftSDN" ]]; then
+                        echo "<ul style=\"margin: 10px 0; padding-left: 20px;\">"
+                        echo "<li>⚠️ <strong>OpenShift SDN:</strong> Legacy networking plugin (deprecated)</li>"
+                        echo "<li>🔄 <strong>Migration:</strong> Consider migrating to OVN-Kubernetes for better features</li>"
+                        echo "<li>📉 <strong>Support:</strong> Limited new feature development</li>"
+                        echo "<li>🔧 <strong>Functionality:</strong> Basic networking with limited advanced features</li>"
+                        echo "</ul>"
+                    else
+                        echo "<ul style=\"margin: 10px 0; padding-left: 20px;\">"
+                        echo "<li>❓ <strong>Unknown Network Type:</strong> Custom or third-party CNI plugin detected</li>"
+                        echo "<li>🔍 <strong>Verification:</strong> Ensure proper configuration and support</li>"
+                        echo "</ul>"
+                    fi)
+                </div>
+                
+                <div class="info-message">
+                    <strong>CIDR Configuration:</strong>
+                    <ul style="margin: 10px 0; padding-left: 20px;">
+                        <li><strong>Cluster Network:</strong> <code>${pod_network_status["cluster_network_cidr"]}</code> - IP range for pod-to-pod communication</li>
+                        <li><strong>Service Network:</strong> <code>${pod_network_status["service_network_cidr"]}</code> - IP range for Kubernetes services</li>
+                        <li><strong>Host Prefix:</strong> <code>/${pod_network_status["host_prefix"]}</code> - Subnet size per node (${pod_network_status["pod_subnet_size"]} IPs available per node)</li>
+                    </ul>
+                </div>
+                
+$(if [[ "${pod_network_status["failed_pods"]}" -gt 0 ]]; then
+cat << 'FAILED_PODS_EOF'
+                <div class="error-message">
+                    <strong>Failed Pods Detected:</strong> ${pod_network_status["failed_pods"]} pod(s) are in failed state. 
+                    Investigate pod logs and events to identify networking or resource issues.
+                    <div class="code-block">oc get pods -A --field-selector=status.phase=Failed</div>
+                </div>
+FAILED_PODS_EOF
+fi)
+
+$(if [[ "${pod_network_status["pending_pods"]}" -gt 0 ]]; then
+cat << 'PENDING_PODS_EOF'
+                <div class="warning-message">
+                    <strong>Pending Pods:</strong> ${pod_network_status["pending_pods"]} pod(s) are in pending state. 
+                    Check for resource constraints or scheduling issues.
+                    <div class="code-block">oc get pods -A --field-selector=status.phase=Pending</div>
+                </div>
+PENDING_PODS_EOF
+fi)
+                
+                <h3 style="margin: 30px 0 15px 0; color: #495057;">Network Troubleshooting Commands</h3>
+                <div class="info-message">
+                    <strong>Useful Commands for Network Analysis:</strong>
+                    <ul style="margin: 10px 0; padding-left: 20px;">
+                        <li><strong>Check pod network status:</strong> <code>oc get pods -A -o wide</code></li>
+                        <li><strong>View network configuration:</strong> <code>oc get networks.operator.openshift.io cluster -o yaml</code></li>
+                        <li><strong>Check network operator logs:</strong> <code>oc logs -n openshift-network-operator deployment/network-operator</code></li>
+                        <li><strong>Verify node network status:</strong> <code>oc get nodes -o jsonpath='{.items[*].spec.podCIDR}'</code></li>
+                        <li><strong>Check CNI pods:</strong> <code>oc get pods -n openshift-multus</code></li>
+                    </ul>
+                </div>
+EOF
+    
+    # Add errors if any
+    if [[ -n "${pod_network_status["errors"]}" ]]; then
+        cat << EOF
+                <div class="error-message">
+                    <strong>Errors:</strong> ${pod_network_status["errors"]}
+                </div>
+EOF
+    fi
+    
+    echo "            </div>"
+    echo "        </div>"
 }
 
 # Generate node details section
@@ -8886,7 +13654,30 @@ generate_html_report() {
         cluster_uuid="Unknown"
     fi
     
-
+    # Try to get API server URL
+    local api_server_url="Unknown"
+    local api_server_display="Unknown"
+    if api_server_url=$(oc whoami --show-server 2>/dev/null); then
+        log_debug "Retrieved API server URL: ${api_server_url}"
+        api_server_display=$(echo "${api_server_url}" | sed 's|https\?://||')
+    else
+        log_warn "Could not retrieve API server URL"
+        api_server_url="#"
+        api_server_display="Unknown"
+    fi
+    
+    # Try to get Console URL
+    local console_url="Unknown"
+    local console_display="Unknown"
+    if console_host=$(oc get route console -n openshift-console -o jsonpath='{.spec.host}' 2>/dev/null); then
+        log_debug "Retrieved console host: ${console_host}"
+        console_url="https://${console_host}"
+        console_display="${console_host}"
+    else
+        log_warn "Could not retrieve console URL"
+        console_url="#"
+        console_display="Unknown"
+    fi
     
     # Try to get node count
     if node_count=$(oc get nodes --no-headers 2>/dev/null | wc -l); then
@@ -8901,18 +13692,24 @@ generate_html_report() {
     
     # Generate HTML content
     {
-        generate_html_header "${cluster_name}" "${cluster_version}" "${cluster_channel}" "${kubernetes_version}" "${cluster_uuid}" "${node_count}" "${report_timestamp}"
+        generate_html_header "${cluster_name}" "${cluster_version}" "${cluster_channel}" "${kubernetes_version}" "${cluster_uuid}" "${node_count}" "${report_timestamp}" "${api_server_url}" "${api_server_display}" "${console_url}" "${console_display}"
         generate_summary_section
         generate_fips_section
         generate_ntp_section
         generate_etcd_section
+        generate_cert_authority_section
         generate_oauth_section
         generate_cluster_operators_section
+        generate_update_service_section
         generate_alertmanager_section
         generate_loki_section
         generate_ipsec_section
+        generate_connectivity_section
         generate_backup_section
         generate_ingress_section
+        generate_storage_section
+        generate_odf_section
+        generate_pod_network_section
         generate_node_details_section
         generate_html_footer
     } > "${OUTPUT_FILE}"
@@ -8973,6 +13770,28 @@ main() {
         etcd_encryption_status["errors"]="Data collection failed"
     fi
     
+    log_info "Collecting certificate authority data..."
+    if ! check_certificate_authority_status; then
+        log_warn "Certificate authority check failed, using default values"
+        cert_authority_status["overall_status"]="${STATUS_UNKNOWN}"
+        cert_authority_status["overall_message"]="Certificate authority check failed"
+        cert_authority_status["api_cert_issuer"]="unknown"
+        cert_authority_status["api_cert_subject"]="unknown"
+        cert_authority_status["api_cert_expiry"]="unknown"
+        cert_authority_status["api_cert_days_remaining"]="unknown"
+        cert_authority_status["api_cert_is_ca_signed"]="unknown"
+        cert_authority_status["ingress_cert_issuer"]="unknown"
+        cert_authority_status["ingress_cert_subject"]="unknown"
+        cert_authority_status["ingress_cert_expiry"]="unknown"
+        cert_authority_status["ingress_cert_days_remaining"]="unknown"
+        cert_authority_status["ingress_cert_is_ca_signed"]="unknown"
+        cert_authority_status["custom_ca_configured"]="unknown"
+        cert_authority_status["ca_bundle_configured"]="unknown"
+        cert_authority_status["proxy_ca_configured"]="unknown"
+        cert_authority_status["check_timestamp"]="$(get_timestamp)"
+        cert_authority_status["errors"]="Data collection failed"
+    fi
+    
     log_info "Collecting OAuth authentication data..."
     if ! check_oauth_authentication_status; then
         log_warn "OAuth authentication check failed, using default values"
@@ -8998,6 +13817,27 @@ main() {
         cluster_operators_status["total_operators"]="0"
         cluster_operators_status["check_timestamp"]="$(get_timestamp)"
         cluster_operators_status["errors"]="Data collection failed"
+    fi
+    
+    log_info "Collecting OpenShift Update Service data..."
+    if ! check_update_service_status; then
+        log_warn "Update Service check failed, using default values"
+        update_service_status["overall_status"]="${STATUS_UNKNOWN}"
+        update_service_status["overall_message"]="Update Service check failed"
+        update_service_status["update_service_configured"]="unknown"
+        update_service_status["update_service_operator_status"]="unknown"
+        update_service_status["update_service_pods"]="0"
+        update_service_status["healthy_update_service_pods"]="0"
+        update_service_status["cluster_version_operator_status"]="unknown"
+        update_service_status["current_version"]="unknown"
+        update_service_status["desired_version"]="unknown"
+        update_service_status["update_available"]="unknown"
+        update_service_status["update_channel"]="unknown"
+        update_service_status["update_server"]="unknown"
+        update_service_status["upstream_configured"]="unknown"
+        update_service_status["environment_type"]="unknown"
+        update_service_status["check_timestamp"]="$(get_timestamp)"
+        update_service_status["errors"]="Data collection failed"
     fi
     
     log_info "Collecting AlertManager data..."
@@ -9062,6 +13902,20 @@ main() {
         backup_status["errors"]="Data collection failed"
     fi
     
+    log_info "Collecting cluster connectivity data..."
+    if ! check_cluster_connectivity; then
+        log_warn "Cluster connectivity check failed, using default values"
+        connectivity_status["overall_status"]="${STATUS_UNKNOWN}"
+        connectivity_status["overall_message"]="Failed to determine cluster connectivity"
+        connectivity_status["connectivity_type"]="unknown"
+        connectivity_status["imagedigestmirrorset_count"]="0"
+        connectivity_status["imagecontentsourcepolicy_count"]="0"
+        connectivity_status["mirror_registries"]=""
+        connectivity_status["check_timestamp"]="$(get_timestamp)"
+        connectivity_status["details"]=""
+        connectivity_status["errors"]="Data collection failed"
+    fi
+    
     log_info "Collecting OpenShift Ingress data..."
     if ! check_ingress_status; then
         log_warn "Ingress status check failed, using default values"
@@ -9082,6 +13936,76 @@ main() {
         ingress_status["check_timestamp"]="$(get_timestamp)"
         ingress_status["details"]="{}"
         ingress_status["errors"]="Data collection failed"
+    fi
+    
+    log_info "Collecting storage classes data..."
+    if ! check_storage_classes; then
+        log_warn "Storage classes check failed, using default values"
+        storage_status["overall_status"]="${STATUS_UNKNOWN}"
+        storage_status["overall_message"]="Storage classes check failed"
+        storage_status["total_storage_classes"]="0"
+        storage_status["default_storage_class"]="unknown"
+        storage_status["csi_storage_classes"]="0"
+        storage_status["non_csi_storage_classes"]="0"
+        storage_status["backend_storage_types"]=""
+        storage_status["provisioner_types"]=""
+        storage_status["volume_binding_modes"]=""
+        storage_status["reclaim_policies"]=""
+        storage_status["allow_volume_expansion"]="0"
+        storage_status["check_timestamp"]="$(get_timestamp)"
+        storage_status["details"]="[]"
+        storage_status["errors"]="Data collection failed"
+    fi
+    
+    log_info "Collecting OpenShift Data Foundation (ODF) data..."
+    if ! check_odf_status; then
+        log_warn "ODF status check failed, using default values"
+        odf_status["overall_status"]="${STATUS_UNKNOWN}"
+        odf_status["overall_message"]="ODF status check failed"
+        odf_status["odf_installed"]="unknown"
+        odf_status["odf_version"]="unknown"
+        odf_status["deployment_mode"]="unknown"
+        odf_status["storage_cluster_status"]="unknown"
+        odf_status["storage_cluster_name"]="unknown"
+        odf_status["ceph_cluster_health"]="unknown"
+        odf_status["noobaa_status"]="unknown"
+        odf_status["mcg_status"]="unknown"
+        odf_status["s3_endpoint"]="unknown"
+        odf_status["mcg_version"]="unknown"
+        odf_status["bucket_claims_count"]="0"
+        odf_status["object_bucket_claims_count"]="0"
+        odf_status["noobaa_accounts_count"]="0"
+        odf_status["mcg_pod_details"]=""
+        odf_status["storage_nodes_count"]="0"
+        odf_status["storage_capacity_total"]="unknown"
+        odf_status["pv_count"]="0"
+        odf_status["pvc_count"]="0"
+        odf_status["check_timestamp"]="$(get_timestamp)"
+        odf_status["details"]="{}"
+        odf_status["errors"]="Data collection failed"
+    fi
+    
+    log_info "Collecting pod network details data..."
+    if ! check_pod_network_details; then
+        log_warn "Pod network details check failed, using default values"
+        pod_network_status["overall_status"]="${STATUS_UNKNOWN}"
+        pod_network_status["overall_message"]="Pod network details check failed"
+        pod_network_status["network_type"]="unknown"
+        pod_network_status["cluster_network_cidr"]="unknown"
+        pod_network_status["service_network_cidr"]="unknown"
+        pod_network_status["host_prefix"]="unknown"
+        pod_network_status["pod_subnet_size"]="unknown"
+        pod_network_status["total_pods"]="0"
+        pod_network_status["running_pods"]="0"
+        pod_network_status["pending_pods"]="0"
+        pod_network_status["failed_pods"]="0"
+        pod_network_status["nodes_with_pods"]="0"
+        pod_network_status["total_nodes"]="0"
+        pod_network_status["network_plugin"]="unknown"
+        pod_network_status["mtu_size"]="unknown"
+        pod_network_status["check_timestamp"]="$(get_timestamp)"
+        pod_network_status["details"]="{}"
+        pod_network_status["errors"]="Data collection failed"
     fi
     
     log_info "Collecting node details data..."

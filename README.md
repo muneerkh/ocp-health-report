@@ -2,34 +2,64 @@
 
 A comprehensive bash script that generates detailed HTML health reports for OpenShift clusters, providing insights into cluster status, security compliance, and operational health with intelligent placement validation and actionable recommendations.
 
+## Quick Feature Overview
+
+This script performs **17 comprehensive health checks** covering:
+- 🔒 **Security**: FIPS compliance, etcd/IPSec encryption, certificates, OAuth
+- 🌐 **Networking**: Pod networks, ingress controllers, connectivity analysis  
+- 💾 **Storage**: Storage classes, ODF/Ceph health, capacity planning
+- 🔧 **Operations**: Cluster operators, updates, monitoring, backups
+- 📊 **Infrastructure**: Node details, Machine Config Pools, resource utilization
+
+**Key Capabilities:**
+- SSH-based node validation for FIPS and NTP compliance
+- Smart ingress placement analysis with actionable recommendations
+- Complete OpenShift Data Foundation (ODF) health assessment
+- Airgapped vs connected environment detection
+- Professional HTML reports with responsive design and copy-ready commands
+
 ## Features
 
-### Core Health Checks
-- **FIPS Compliance**: Validates FIPS mode across all cluster nodes with SSH connectivity
-- **NTP Synchronization**: Checks time synchronization status on all nodes
-- **etcd Encryption**: Monitors etcd encryption configuration and key rotation status
-- **Ingress Controller**: Advanced placement validation with infra node preference
-- **Cluster Status**: Overall cluster health, version information, and channel details
-- **Node Health**: Individual node status and resource utilization
-- **Operator Status**: Health of cluster operators with degradation detection
-- **AlertManager Configuration**: Alert routing and notification setup
-- **Loki Logging**: Log aggregation and storage status
-- **Backup Status**: etcd backup and cronjob monitoring
+### Security & Compliance Checks
+- **FIPS Compliance**: Validates FIPS mode across all cluster nodes with SSH connectivity and detailed per-node analysis
+- **etcd Encryption**: Monitors etcd encryption configuration, key rotation status, and reencryption verification
+- **IPSec Encryption**: Checks OVN-Kubernetes IPSec configuration for pod-to-pod encryption
+- **Certificate Authority**: Validates API server and ingress certificates, CA configuration, and expiry tracking
+- **OAuth Authentication**: Analyzes identity provider configuration, OAuth pod health, and authentication setup
 
-### Advanced Ingress Analysis
-- **Smart Placement Detection**: Prioritizes actual pod placement over configuration
-- **Multiple Node Selector Patterns**: Supports infra, infrastructure, worker, and matchLabels
-- **Toleration Analysis**: Detects taint tolerations for proper node scheduling
-- **NodeAffinity Support**: Handles complex node affinity configurations
-- **Replica Optimization**: Intelligent HA recommendations based on cluster size
+### Infrastructure & Networking
+- **NTP Synchronization**: Checks time synchronization status across all nodes with chronyd service monitoring
+- **Pod Network Details**: Comprehensive network configuration analysis including CIDR ranges, MTU, and plugin details
+- **Ingress Controller**: Advanced placement validation with smart detection and HA recommendations
+- **Node Details**: Complete node inventory with roles, taints, labels, and Machine Config Pool status
+- **Cluster Connectivity**: Detects airgapped vs connected environments with mirror registry analysis
+
+### Storage & Data Management
+- **Storage Classes**: Analyzes all storage classes, CSI drivers, provisioners, and backend storage types
+- **OpenShift Data Foundation (ODF)**: Complete ODF health check including Ceph cluster, NooBaa, and MCG status
+- **Storage Capacity**: Monitors storage utilization, PV/PVC counts, and capacity planning metrics
+- **Backup Status**: etcd backup verification, OADP operator status, and backup schedule monitoring
+
+### Operations & Monitoring
+- **Cluster Operators**: Health status of all cluster operators with degradation detection and version tracking
+- **Update Service**: OpenShift update configuration, available updates, and channel management
+- **AlertManager**: Alert routing configuration, receiver setup, and notification channel validation
+- **Loki Logging**: Log aggregation status, tenant configuration, and retention policy analysis
+
+### Advanced Analysis Features
+- **Smart Placement Detection**: Prioritizes actual pod placement over configuration for accurate status reporting
+- **Multiple Node Selector Patterns**: Supports infra, infrastructure, worker, and complex matchLabels configurations
+- **Toleration Analysis**: Detects taint tolerations for proper node scheduling and dedicated infrastructure
+- **NodeAffinity Support**: Handles complex node affinity rules and scheduling constraints
+- **Replica Optimization**: Intelligent HA recommendations based on cluster topology and available nodes
 
 ### Report Features
-- **Professional HTML Output**: Modern, responsive design with gradient styling
-- **Real-time Status Indicators**: Color-coded status badges for quick assessment
-- **Actionable Commands**: Copy-ready oc patch commands with proper styling
-- **Detailed Metrics**: Comprehensive data collection with error handling
-- **Timestamp Tracking**: Report generation time and data collection timestamps
-- **Export Capabilities**: Self-contained HTML reports for sharing
+- **Professional HTML Output**: Modern, responsive design with gradient styling and interactive elements
+- **Real-time Status Indicators**: Color-coded status badges with detailed health metrics
+- **Actionable Commands**: Copy-ready oc patch commands with proper syntax highlighting
+- **Comprehensive Metrics**: Detailed data collection with robust error handling and retry logic
+- **Timestamp Tracking**: Report generation time and individual module execution timestamps
+- **Export Capabilities**: Self-contained HTML reports for sharing and archival
 
 ## Prerequisites
 
@@ -128,54 +158,95 @@ The script generates a comprehensive HTML report containing:
 1. **FIPS Compliance Status**
    - Per-node FIPS mode verification with SSH validation
    - Compliance summary and security recommendations
-   - Detailed node-by-node analysis
+   - Detailed node-by-node analysis with connectivity status
 
 2. **NTP Synchronization**
    - Time synchronization status across all nodes
    - NTP server configuration and drift analysis
-   - Chronyd service monitoring
+   - Chronyd service monitoring and time accuracy metrics
 
 3. **etcd Encryption**
    - Encryption configuration status and validation
-   - Key rotation monitoring and history
+   - Key rotation monitoring and reencryption verification
    - Pod health verification and performance metrics
 
-4. **Ingress Controller Analysis**
-   - **Smart Placement Validation**: Actual vs. configured placement
-   - **Node Selector Detection**: Supports multiple patterns (infra, infrastructure, worker)
-   - **Toleration Analysis**: Taint handling for dedicated nodes
-   - **Replica Recommendations**: HA optimization based on cluster topology
-   - **Actionable Commands**: Ready-to-use oc patch commands
+4. **IPSec Encryption**
+   - OVN-Kubernetes IPSec configuration analysis
+   - Pod-to-pod encryption status and mode detection
+   - Network plugin compatibility and security validation
 
-5. **Cluster Overview**
-   - Overall cluster health and API availability
-   - Control plane component status
-   - Version compatibility matrix
+5. **Certificate Authority**
+   - API server certificate validation and expiry tracking
+   - Ingress certificate analysis and CA chain verification
+   - Custom CA configuration and proxy certificate setup
 
-6. **Node Status**
-   - Individual node health and conditions
-   - Resource utilization and capacity planning
-   - Taints and labels analysis
+6. **OAuth Authentication**
+   - Identity provider configuration and type analysis
+   - OAuth pod health and authentication flow validation
+   - Multi-provider setup and integration status
 
-7. **Operator Health**
-   - Cluster operator status with degradation details
-   - Version information and update readiness
-   - Operator-specific recommendations
+7. **Cluster Operators**
+   - All cluster operator health with degradation detection
+   - Version information and update readiness status
+   - Operator-specific recommendations and troubleshooting
 
-8. **AlertManager Configuration**
+8. **Update Service**
+   - OpenShift update configuration and channel management
+   - Available updates and upgrade path analysis
+   - Connected vs airgapped update service configuration
+
+9. **AlertManager Configuration**
    - Alert routing rules and notification channels
-   - Silence status and alert history
-   - Integration health checks
+   - Receiver configuration and integration health
+   - Alert history and silence management
 
-9. **Loki Logging**
-   - Log aggregation status and performance
-   - Storage configuration and retention
-   - Query performance and indexing
+10. **Loki Logging**
+    - Log aggregation status and tenant configuration
+    - Storage configuration and retention policies
+    - Component health and query performance
 
-10. **Backup Status**
-    - etcd backup verification and scheduling
-    - Cronjob monitoring and success rates
-    - Retention policies and recovery procedures
+11. **Cluster Connectivity**
+    - Airgapped vs connected environment detection
+    - Mirror registry configuration and image source policies
+    - Network connectivity and external access validation
+
+12. **Ingress Controller Analysis**
+    - **Smart Placement Validation**: Actual vs. configured placement
+    - **Node Selector Detection**: Supports multiple patterns (infra, infrastructure, worker)
+    - **Toleration Analysis**: Taint handling for dedicated nodes
+    - **Replica Recommendations**: HA optimization based on cluster topology
+    - **Actionable Commands**: Ready-to-use oc patch commands
+
+13. **Storage Classes**
+    - Complete storage class inventory and CSI driver analysis
+    - Backend storage types and provisioner configuration
+    - Volume binding modes and reclaim policies
+    - Default storage class validation and recommendations
+
+14. **OpenShift Data Foundation (ODF)**
+    - ODF operator installation and version tracking
+    - Ceph cluster health and storage node status
+    - NooBaa and Multi-Cloud Gateway (MCG) analysis
+    - Storage capacity utilization and PV/PVC metrics
+    - S3 endpoint configuration and bucket management
+
+15. **Pod Network Details**
+    - Network plugin configuration and CIDR analysis
+    - Pod distribution across nodes and network health
+    - MTU configuration and network performance metrics
+    - Service network configuration and connectivity
+
+16. **Node Details**
+    - Complete node inventory with roles and labels
+    - Machine Config Pool status and update progress
+    - Node resource utilization and capacity planning
+    - Taint and toleration analysis for workload placement
+
+17. **Backup Status**
+    - etcd backup verification and scheduling analysis
+    - OADP operator status and backup job monitoring
+    - Retention policies and recovery procedure validation
+    - Backup failure analysis and recommendations
 
 ## Exit Codes
 
@@ -239,6 +310,41 @@ oc get nodes --show-labels
 oc describe nodes | grep -A5 -B5 Taints
 ```
 
+**FIPS Compliance Issues**
+```bash
+# Check FIPS status on nodes
+oc debug node/<node-name> -- chroot /host cat /proc/sys/crypto/fips_enabled
+
+# Verify Machine Config for FIPS
+oc get machineconfig | grep fips
+oc get machineconfig 99-master-fips -o yaml
+```
+
+**Storage and ODF Issues**
+```bash
+# Check ODF operator status
+oc get csv -n openshift-storage | grep odf
+
+# Verify Ceph cluster health
+oc get cephcluster -n openshift-storage
+oc get pods -n openshift-storage | grep -E "(ceph|noobaa|rook)"
+
+# Check storage classes
+oc get storageclass
+oc describe storageclass <storage-class-name>
+```
+
+**Network and Connectivity Issues**
+```bash
+# Check network configuration
+oc get network.config cluster -o yaml
+oc get clusternetwork
+
+# Verify pod network status
+oc get pods --all-namespaces -o wide | grep -v Running
+oc describe network.operator cluster
+```
+
 ### Debug Mode
 
 Enable debug mode for detailed troubleshooting:
@@ -275,7 +381,7 @@ The script intelligently detects various node placement patterns:
 - Configurable location via `--temp-dir` option
 - Proper file permissions (600) for security
 
-## Enhanced Ingress Controller Analysis
+## Enhanced Analysis Features
 
 ### Smart Placement Validation
 The script provides intelligent ingress controller placement analysis that prioritizes **actual placement** over configuration:
@@ -283,6 +389,24 @@ The script provides intelligent ingress controller placement analysis that prior
 - ✅ **Mixed placement**: Shows "Fine" but warns about suboptimal distribution  
 - ✅ **Worker placement**: Acceptable when no infra nodes are available
 - ⚠️ **Configuration issues**: Only flagged when actual placement is problematic
+
+### Comprehensive Security Analysis
+- **FIPS Compliance**: Direct `/proc/sys/crypto/fips_enabled` validation with SSH connectivity testing
+- **Encryption Status**: etcd encryption, IPSec pod-to-pod encryption, and certificate validation
+- **Authentication**: OAuth identity provider analysis with multi-provider support
+- **Certificate Management**: API and ingress certificate expiry tracking with CA chain validation
+
+### Storage and Data Foundation Analysis
+- **Multi-Storage Backend Support**: Analyzes various storage classes including Ceph, NFS, cloud providers
+- **ODF Deep Dive**: Complete OpenShift Data Foundation health including Ceph cluster status
+- **Capacity Planning**: Storage utilization metrics and growth trend analysis
+- **Backup Validation**: Comprehensive backup status with OADP integration
+
+### Network and Connectivity Analysis
+- **Network Plugin Detection**: Supports OVN-Kubernetes, OpenShift SDN analysis
+- **Connectivity Assessment**: Airgapped vs connected environment detection
+- **Mirror Registry Analysis**: Image source policies and digest mirror sets
+- **Pod Network Health**: CIDR allocation, MTU configuration, and distribution metrics
 
 ### Supported Node Selector Patterns
 ```yaml
@@ -314,23 +438,54 @@ nodeAffinity:
 ### Actionable Recommendations
 The report provides ready-to-use commands with proper styling:
 ```bash
-# Configure for infra nodes
+# Configure ingress for infra nodes
 oc patch ingresscontroller default -n openshift-ingress-operator \
   --type=merge -p '{"spec":{"nodePlacement":{"nodeSelector":{"node-role.kubernetes.io/infra":""}}}}'
 
 # Scale replicas for HA
 oc patch ingresscontroller default -n openshift-ingress-operator \
   --type=merge -p '{"spec":{"replicas":3}}'
+
+# Enable etcd encryption
+oc patch apiserver cluster --type=merge \
+  -p '{"spec":{"encryption":{"type":"aescbc"}}}'
+
+# Configure FIPS mode
+oc patch machineconfig 99-master-fips --type=merge \
+  -p '{"spec":{"fips":true}}'
 ```
+
+## Data Collection Details
+
+### Comprehensive Health Metrics
+The script collects over **200+ data points** across all cluster components:
+
+**Security Metrics**: FIPS status per node, encryption configurations, certificate expiry dates, OAuth provider details
+**Performance Metrics**: Pod counts, resource utilization, storage capacity, network MTU settings
+**Configuration Metrics**: Node selectors, tolerations, storage classes, backup schedules
+**Operational Metrics**: Operator health, update channels, alert configurations, log retention
+
+### Intelligent Error Handling
+- **Retry Logic**: Automatic retry for transient API failures with exponential backoff
+- **Graceful Degradation**: Continues collection even if individual modules fail
+- **Detailed Logging**: Comprehensive debug output for troubleshooting
+- **Validation**: JSON parsing validation and data integrity checks
+
+### SSH-Based Node Validation
+- **Automatic Key Discovery**: Finds SSH keys in `~/.ssh/` directory automatically
+- **Multi-Key Testing**: Tests multiple keys until successful connection
+- **Secure Access**: Uses proper SSH permissions and connection handling
+- **Fallback Support**: Graceful handling when SSH access is unavailable
 
 ## Security Considerations
 
 - Script requires cluster-admin privileges for comprehensive checks
-- SSH keys are handled securely with proper permissions
-- Temporary files are created with restricted access (600)
-- No sensitive data is logged in normal operation
-- HTML output contains no embedded credentials
-- Ingress analysis respects cluster security policies
+- SSH keys are handled securely with proper permissions (600)
+- Temporary files are created with restricted access in isolated directories
+- No sensitive data is logged in normal operation mode
+- HTML output contains no embedded credentials or secrets
+- All API calls use authenticated OpenShift CLI sessions
+- Ingress analysis respects cluster security policies and RBAC
 
 ## Contributing
 
@@ -373,11 +528,26 @@ Email: muneerkh@gmail.com
 
 ## Version History
 
-- **v1.0.0**: Initial release with comprehensive health checking capabilities
-- **v1.1.0**: Added advanced ingress controller analysis with smart placement detection
-- **v1.2.0**: Enhanced node selector pattern support (infra, infrastructure, matchLabels)
-- **v1.3.0**: Improved placement validation prioritizing actual over configured placement
-- **v1.4.0**: Added actionable recommendations with styled code blocks and oc commands
+- **v1.0.0**: Initial release with comprehensive health checking capabilities including:
+  - FIPS compliance validation across all nodes
+  - NTP synchronization monitoring with chronyd service checks
+  - etcd encryption status and key rotation analysis
+  - IPSec encryption configuration for OVN-Kubernetes
+  - Certificate authority validation for API and ingress
+  - OAuth authentication provider analysis
+  - Complete cluster operator health monitoring
+  - Update service configuration and channel management
+  - AlertManager routing and receiver configuration
+  - Loki logging tenant setup and component health
+  - Cluster connectivity detection (airgapped vs connected)
+  - Advanced ingress controller placement analysis
+  - Storage classes and CSI driver inventory
+  - OpenShift Data Foundation (ODF) comprehensive health check
+  - Pod network details and configuration analysis
+  - Detailed node inventory with Machine Config Pool status
+  - Backup status verification with OADP integration
+  - Professional HTML report generation with responsive design
+  - Actionable recommendations with copy-ready commands
 
 ---
 
